@@ -230,7 +230,9 @@ const SEED=[
 'Holly Donaghy',
 'Cadhla Stilgies'
 ].map(n=>({id:uid(), name:n, num:null, pos:'', active:true}));
-const today=()=>new Date().toISOString().slice(0,10);
+/* local date, not UTC — toISOString() gives yesterday's date after midnight during Irish summer time */
+const today=()=>{const d=new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;};
+const DEFAULT_HALF=30;
 const fmtDate=d=>{try{return new Date(d+'T12:00').toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'});}catch(e){return d;}};
 
 async function storGet(){
@@ -254,15 +256,39 @@ async function load(){
   render();
 }
 let saveTimer=null;
+async function flushSave(){
+  clearTimeout(saveTimer); saveTimer=null;
+  storageOK=await storSet(JSON.stringify(DB));
+  const sb=document.getElementById('savebar');
+  if(sb) sb.textContent= storageOK? 'Saved ✓' : 'Storage unavailable — data held in this session only';
+}
 function save(){
   clearTimeout(saveTimer);
-  saveTimer=setTimeout(async ()=>{
-    storageOK=await storSet(JSON.stringify(DB));
-    const sb=document.getElementById('savebar');
-    if(sb) sb.textContent= storageOK? 'Saved ✓' : 'Storage unavailable — data held in this session only';
-  }, 250);
+  saveTimer=setTimeout(flushSave, 250);
 }
+/* write immediately if the phone is locked or the app is swiped away mid-debounce,
+   so the last score tapped before pocketing the phone isn't lost */
+const flushIfPending=()=>{ if(saveTimer) flushSave(); };
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') flushIfPending(); });
+window.addEventListener('pagehide', flushIfPending);
+/* ask the browser not to evict our data when the phone is low on space */
+try{ if(navigator.storage && navigator.storage.persist) navigator.storage.persist(); }catch(e){}
 if('serviceWorker' in navigator){ try{ navigator.serviceWorker.register('./sw.js'); }catch(e){} }
+
+/* keep the screen awake while a match is live, so the clock and buttons are
+   there when you glance down — the browser drops the lock when the app is
+   backgrounded, so it's re-requested on return */
+let wakeLock=null;
+async function syncWakeLock(){
+  const want= !!DB.live && document.visibilityState==='visible';
+  try{
+    if(want && !wakeLock && navigator.wakeLock){
+      wakeLock=await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release',()=>{ wakeLock=null; });
+    } else if(!want && wakeLock){ await wakeLock.release(); wakeLock=null; }
+  }catch(e){ wakeLock=null; }
+}
+document.addEventListener('visibilitychange', syncWakeLock);
 
 /* ================= HELPERS ================= */
 /* LGFA positions: GK · corner backs + full back · wing backs + centre half-back · midfield · wing forwards + centre half-forward · corner forwards + full forward */
@@ -302,7 +328,7 @@ function timerFmt(ms){
 }
 function timerStart(t){ return {...t, running:true, startedAt:Date.now()}; }
 function timerPause(t){ return {...t, running:false, startedAt:null, accumMs:timerElapsedMs(t,Date.now())}; }
-function timerReset(halfLenMin){ return {running:false, startedAt:null, accumMs:0, halfLen:halfLenMin||30}; }
+function timerReset(halfLenMin){ return {running:false, startedAt:null, accumMs:0, halfLen:halfLenMin||DEFAULT_HALF}; }
 /* Auto-start the match clock the moment anything gets logged, in case the
    coach forgets to press Start — only kicks in if a timer exists and isn't
    already running, so it never overrides a deliberate pause. */
@@ -311,18 +337,26 @@ function ensureTimerRunning(){
     DB.live.timer=timerStart(DB.live.timer);
   }
 }
+/* push a live-match event stamped with the half and the minute of that half
+   (1-based, like a referee's watch: 0:00–0:59 is the 1st minute) */
+function logEvent(ev){
+  ensureTimerRunning();
+  const min=Math.floor(timerElapsedMs(DB.live.timer, Date.now())/60000)+1;
+  DB.live.events.push({t:Date.now(), half:DB.live.half, min, ...ev});
+}
+const evWhen=e=>`H${e.half}${e.min?` ${e.min}'`:''}`;
 function renderTimer(t){
   const elapsed=timerElapsedMs(t, Date.now());
-  const halfMs=(t.halfLen||30)*60*1000;
+  const halfMs=(t.halfLen||DEFAULT_HALF)*60*1000;
   const remaining=halfMs-elapsed;
   const over=remaining<0;
   return `
   <div class="timer-box ${over?'over':''}">
     <div class="timer-clock">${over?'+':''}${timerFmt(Math.abs(remaining))}</div>
-    <div class="timer-sub">${over?'into injury time':'remaining this half'} · ${t.halfLen||30}min halves</div>
+    <div class="timer-sub">${over?'into injury time':'remaining this half'} · ${t.halfLen||DEFAULT_HALF}min halves</div>
     <div class="row" style="margin-top:8px">
       <button class="btn-y grow" data-act="timer-toggle">${t.running?'⏸ Pause':'▶ Start'}</button>
-      <button class="btn-ghost" data-act="timer-halflen">${t.halfLen||30}min</button>
+      <button class="btn-ghost" data-act="timer-halflen">${t.halfLen||DEFAULT_HALF}min</button>
       <button class="btn-ghost" data-act="timer-reset">↺</button>
     </div>
   </div>`;
@@ -358,11 +392,12 @@ function render(){
   if(TAB==='history') m.innerHTML=viewHistory();
   m.insertAdjacentHTML('beforeend','<div class="savebar" id="savebar"></div>');
   bind();
+  syncWakeLock();
 }
 
 /* ================= SQUAD ================= */
 function viewSquad(){
-  const list=DB.players.slice().sort((a,b)=>(a.num||99)-(b.num||99));
+  const list=DB.players.filter(p=>!p.removed).sort((a,b)=>(a.num||99)-(b.num||99));
   return `
   <div class="card">
     <h2>Add Player</h2>
@@ -392,6 +427,7 @@ function viewSquad(){
   </div>
   <div class="card">
     <h2>Backup</h2>
+    ${backupNote()}
     <div style="font-size:13px;color:var(--muted);margin-bottom:8px">Your data lives on this phone. Export a backup now and again (end of each month is plenty) — it downloads a file you can restore from if you ever change phone or clear the browser.</div>
     <div class="row">
       <button class="btn-ghost grow" data-act="export-data">⬇ Export backup</button>
@@ -406,7 +442,18 @@ function viewSquad(){
     </div>
   </div>`;
 }
+/* nudge when the only copy of the season has gone a month without a backup */
+function backupNote(){
+  const last=DB.settings&&DB.settings.lastBackup;
+  const hasData=DB.sessions.length||DB.matches.length||DB.tests.length;
+  if(!hasData) return '';
+  const days= last? Math.floor((Date.now()-new Date(last+'T12:00'))/864e5) : null;
+  if(days!==null && days<30) return `<div style="font-size:13px;color:var(--good);font-weight:600;margin-bottom:6px">Last backup ${fmtDate(last)} ✓</div>`;
+  return `<div style="font-size:13px;color:var(--bad);font-weight:700;margin-bottom:6px">⚠ ${days===null?'No backup taken yet':`Last backup ${days} days ago`} — export one now.</div>`;
+}
+function markBackedUp(){ DB.settings=DB.settings||{}; DB.settings.lastBackup=today(); save(); }
 function doExport(){
+  markBackedUp();
   const blob=new Blob([JSON.stringify(DB,null,1)],{type:'application/json'});
   const a=document.createElement('a');
   a.href=URL.createObjectURL(blob);
@@ -514,8 +561,10 @@ function buildSeasonReportHTML(){
 }
 
 /* ================= SESSIONS ================= */
-let sessType='pitch', sessOpen=null;
+let sessType='pitch', sessOpen=null, sessEdit=null;
 function viewSessions(){
+  const editing= sessEdit && DB.sessions.find(s=>s.id===sessEdit);
+  if(!editing) sessEdit=null;
   const sessions=DB.sessions.slice().sort((a,b)=>b.date.localeCompare(a.date));
   // attendance summary
   const total=DB.sessions.length;
@@ -525,8 +574,8 @@ function viewSessions(){
   }).sort((a,b)=>b.pct-a.pct);
   return `
   <div class="card">
-    <h2>New Session</h2>
-    <label class="f">Date</label><input id="ss-date" type="date" value="${today()}">
+    <h2>${editing?'Edit Session':'New Session'}</h2>
+    <label class="f">Date</label><input id="ss-date" type="date" value="${editing? editing.date : today()}">
     <label class="f">Type</label>
     <div class="seg" id="ss-type">
       ${['pitch','gym','match','other'].map(t=>`<button data-t="${t}" class="${sessType===t?'on':''}">${t}</button>`).join('')}
@@ -535,7 +584,7 @@ function viewSessions(){
     <div id="ss-list">
       ${activePlayers().sort((a,b)=>(a.num||99)-(b.num||99)).map(p=>`
         <div class="player-li">
-          <input type="checkbox" class="chk ss-chk" value="${p.id}" id="c-${p.id}">
+          <input type="checkbox" class="chk ss-chk" value="${p.id}" id="c-${p.id}" ${editing&&editing.present.includes(p.id)?'checked':''}>
           <label for="c-${p.id}" class="grow" style="display:flex;align-items:center;margin-left:8px">
             <span class="tag-num">${esc(p.num)||'–'}</span><span class="nm">${esc(p.name)}</span>
           </label>
@@ -543,8 +592,9 @@ function viewSessions(){
     </div>
     <div class="row" style="margin-top:10px">
       <button class="btn-ghost grow" data-act="sess-all">Tick all</button>
-      <button class="btn-p grow" data-act="save-session">Save session</button>
+      <button class="btn-p grow" data-act="save-session">${editing?'Update session':'Save session'}</button>
     </div>
+    ${editing?'<button class="btn-ghost btn-block" style="margin-top:8px" data-act="sess-cancel">Cancel edit</button>':''}
   </div>
   <div class="card">
     <h2>Attendance — Season</h2>
@@ -562,7 +612,7 @@ function viewSessions(){
       </div>
       ${sessOpen===s.id? `<div style="padding:4px 8px 10px; font-size:14px; color:var(--muted)">
         ${s.present.map(id=>esc(playerName(id))).join(', ')||'Nobody marked'}
-        <div style="margin-top:6px"><button class="btn-sm btn-danger" data-act="del-sess" data-id="${s.id}">Delete session</button></div>
+        <div style="margin-top:6px" class="row"><button class="btn-sm btn-ghost" data-act="edit-sess" data-id="${s.id}">✎ Edit attendance</button><button class="btn-sm btn-danger" data-act="del-sess" data-id="${s.id}">Delete session</button></div>
       </div>`:''}
     `).join('') || '<div class="empty">Nothing yet.</div>'}
   </div>`;
@@ -671,7 +721,7 @@ function viewLiveMatch(){
   </div>
 
   <div class="card">
-    ${renderTimer(L.timer||timerReset(30))}
+    ${renderTimer(L.timer||timerReset(DEFAULT_HALF))}
   </div>
 
   <div class="card">
@@ -716,7 +766,7 @@ function viewLiveMatch(){
   <div class="card">
     <h2>Event Log <span style="font-size:12px;color:var(--muted);text-transform:none;font-weight:400">— tap any line to edit or delete</span></h2>
     <div class="eventlog">
-      ${L.events.map((e,i)=>({e,i})).reverse().slice(0,40).map(({e,i})=>`<div data-act="edit-event" data-idx="${i}" style="cursor:pointer">H${e.half} · ${evLabel(e)}</div>`).join('')||'<div class="empty">Nothing yet — throw-in when ready.</div>'}
+      ${L.events.map((e,i)=>({e,i})).reverse().slice(0,40).map(({e,i})=>`<div data-act="edit-event" data-idx="${i}" style="cursor:pointer">${evWhen(e)} · ${evLabel(e)}</div>`).join('')||'<div class="empty">Nothing yet — throw-in when ready.</div>'}
     </div>
     <div style="margin-top:12px" class="row">
       <button class="btn-danger grow" data-act="abandon">Discard</button>
@@ -738,7 +788,7 @@ function openEventEditor(idx){
   const L=DB.live; const e=L.events[idx];
   if(!e) return;
   const canReassign = e.team==='us' && ['goal','point1','point2'].includes(e.type);
-  let body=`<h3>H${e.half} · ${evLabel(e)}</h3><div class="picker">`;
+  let body=`<h3>${evWhen(e)} · ${evLabel(e)}</h3><div class="picker">`;
   if(canReassign) body+=`<button data-reassign="1"><span class="tag-num">↔</span>Change who scored</button>`;
   body+=`<button data-del="1" style="color:var(--bad)"><span class="tag-num">✕</span>Delete this event</button></div>`;
   showSheet(body, root=>{
@@ -779,8 +829,8 @@ function openScorerPicker(type){
     </div>`,
     el=>{
       el.querySelectorAll('[data-pick]').forEach(b=>b.onclick=()=>{
-        DB.live.events.push({t:Date.now(), half:DB.live.half, team:'us', type, playerId:b.dataset.pick||null});
-        ensureTimerRunning(); save(); closeSheet(); render();
+        logEvent({team:'us', type, playerId:b.dataset.pick||null});
+        save(); closeSheet(); render();
       });
     });
 }
@@ -802,8 +852,8 @@ function openSubPicker(){
           <div class="picker">${bench.map(p=>li(p,'on')).join('')}</div>`,
           el2=>{
             el2.querySelectorAll('[data-on]').forEach(b2=>b2.onclick=()=>{
-              DB.live.events.push({t:Date.now(), half:DB.live.half, team:'us', type:'sub', off, on:b2.dataset.on});
-              ensureTimerRunning(); save(); closeSheet(); render();
+              logEvent({team:'us', type:'sub', off, on:b2.dataset.on});
+              save(); closeSheet(); render();
             });
           });
       });
@@ -901,17 +951,17 @@ function matchTimeline(m){
     ko_won:'Kickout won',ko_lost:'Kickout lost',ko_mark:'Kickout mark',
     turnover:'Turnover won',free_won:'Free won',free_con:'Free conceded'};
   return m.events.map(e=>{
-    if(e.type==='sub') return `H${e.half}  🔁 Sub: ${playerName(e.on)} on for ${playerName(e.off)}`;
+    if(e.type==='sub') return `${evWhen(e)}  🔁 Sub: ${playerName(e.on)} on for ${playerName(e.off)}`;
     if(['goal','point1','point2'].includes(e.type)){
       const side= e.team==='us'? S.us : S.them;
       if(e.type==='goal')side.g++; else if(e.type==='point1')side.p1++; else side.p2++;
       if(e.team==='us'){
         const who=e.playerId? playerName(e.playerId) : 'Team';
-        return `H${e.half}  ⚽ ${lab[e.type]}: ${who}  (${runningScore()})`;
+        return `${evWhen(e)}  ⚽ ${lab[e.type]}: ${who}  (${runningScore()})`;
       }
-      return `H${e.half}  ${lab[e.type]} conceded  (${runningScore()})`;
+      return `${evWhen(e)}  ${lab[e.type]} conceded  (${runningScore()})`;
     }
-    if(e.team==='us') return `H${e.half}  ${lab[e.type]||e.type}`;
+    if(e.team==='us') return `${evWhen(e)}  ${lab[e.type]||e.type}`;
     return null; // opposition non-scoring events aren't tracked, nothing to show
   }).filter(Boolean).join('\n');
 }
@@ -957,7 +1007,8 @@ Turnovers won: ${c('turnover')} · Frees: won ${c('free_won')}, conceded ${c('fr
 Maith sibh a chailíní! 🟤🟡`;
 }
 function copyText(txt, btn){
-  const done=()=>{ if(btn){btn.textContent='Copied ✓'; setTimeout(()=>{btn.textContent='📋 Copy report';},1500);} };
+  const orig=btn&&btn.textContent;
+  const done=()=>{ if(btn){btn.textContent='Copied ✓'; setTimeout(()=>{btn.textContent=orig;},1500);} };
   if(navigator.clipboard && navigator.clipboard.writeText){
     navigator.clipboard.writeText(txt).then(done).catch(()=>fallbackCopy(txt,done));
   } else fallbackCopy(txt,done);
@@ -985,7 +1036,7 @@ function bind(){
     el.onclick=(ev)=>{handle(el.dataset, el); ev.stopPropagation();};
   });
   const st=document.getElementById('ss-type');
-  if(st) st.querySelectorAll('button').forEach(b=>b.onclick=()=>{sessType=b.dataset.t; render();});
+  if(st) st.querySelectorAll('button').forEach(b=>b.onclick=()=>{sessType=b.dataset.t; st.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));});
   const lp=document.getElementById('lv-player');
   if(lp) lp.onchange=()=>{lvlPlayer=lp.value; render();};
   const lt=document.getElementById('lv-test');
@@ -1011,7 +1062,7 @@ function handle(d, el){
     document.body.classList.toggle('sideline', DB.settings.sideline);
     save(); render();
   }
-  if(a==='copy-sync'){ copyText(encodeSyncCode(), el); }
+  if(a==='copy-sync'){ markBackedUp(); copyText(encodeSyncCode(), el); }
   if(a==='print-report'){
     document.getElementById('print-report').innerHTML=buildSeasonReportHTML();
     setTimeout(()=>window.print(), 80);
@@ -1049,18 +1100,38 @@ function handle(d, el){
     if(v!==null){ p.num=parseInt(v)||null; save(); render(); }
   }
   if(a==='del-player'){
-    if(confirm('Remove this player? Their history stays in saved matches.')){
-      DB.players=DB.players.filter(p=>p.id!==d.id); save(); render();
+    /* hidden rather than deleted, so saved matches, scorer tables and the
+       season report still show their name instead of "Team" */
+    const p=DB.players.find(p=>p.id===d.id);
+    if(confirm(`Remove ${p.name} from the squad? Their goals, appearances and attendance stay in saved matches and reports.`)){
+      p.removed=true; p.active=false; delete p.avail; save(); render();
     }
   }
   if(a==='sess-all'){document.querySelectorAll('.ss-chk').forEach(c=>c.checked=true);}
   if(a==='save-session'){
     const present=[...document.querySelectorAll('.ss-chk:checked')].map(c=>c.value);
-    DB.sessions.push({id:uid(), date:document.getElementById('ss-date').value||today(), type:sessType, present});
+    const date=document.getElementById('ss-date').value||today();
+    const ex=sessEdit && DB.sessions.find(s=>s.id===sessEdit);
+    if(ex){
+      /* keep players who've since gone off the panel — they aren't in the tick list */
+      const listed=new Set(activePlayers().map(p=>p.id));
+      const kept=ex.present.filter(id=>!listed.has(id));
+      Object.assign(ex,{date, type:sessType, present:[...kept, ...present]});
+      sessOpen=ex.id; sessEdit=null; sessType='pitch';
+    }
+    else{
+      if(!present.length && !confirm('Nobody is ticked — save an empty session?')) return;
+      DB.sessions.push({id:uid(), date, type:sessType, present});
+    }
     save(); render();
   }
+  if(a==='edit-sess'){
+    const s=DB.sessions.find(s=>s.id===d.id);
+    sessEdit=s.id; sessType=s.type; render(); window.scrollTo({top:0, behavior:'smooth'});
+  }
+  if(a==='sess-cancel'){ sessEdit=null; sessType='pitch'; render(); }
   if(a==='open-sess'){sessOpen= sessOpen===d.id? null : d.id; render();}
-  if(a==='del-sess'){DB.sessions=DB.sessions.filter(s=>s.id!==d.id); save(); render();}
+  if(a==='del-sess'){ if(confirm('Delete this session? Attendance figures will be recalculated.')){ DB.sessions=DB.sessions.filter(s=>s.id!==d.id); if(sessEdit===d.id) sessEdit=null; save(); render(); } }
   if(a==='del-test'){
     if(confirm('Delete this test result?')){
       DB.tests=DB.tests.filter(t=>t.id!==d.id); save(); render();
@@ -1078,9 +1149,12 @@ function handle(d, el){
   if(a==='start-match'){
     const opp=document.getElementById('mt-opp').value.trim();
     if(!opp){alert('Who are we playing?'); return;}
+    if(pickLineup.size!==15 && !confirm(pickLineup.size?
+      `You've picked ${pickLineup.size} starters, not 15. Start anyway?` :
+      'No starting team picked — subs and "who scored" lists won\'t know who\'s on the pitch. Start anyway?')) return;
     DB.live={id:uid(), date:document.getElementById('mt-date').value||today(), opponent:opp,
       comp:document.getElementById('mt-comp').value, lineup:[...pickLineup], half:1, events:[],
-      timer:timerReset(30)};
+      timer:timerReset(DEFAULT_HALF)};
     pickLineup=new Set(); save(); render();
   }
   if(a==='sub'){openSubPicker();}
@@ -1096,31 +1170,35 @@ function handle(d, el){
     if(m){ copyText(matchSummary(m), el); }
   }
   if(a==='set-half'){
-    DB.live.half=+d.h;
-    DB.live.timer=timerReset((DB.live.timer&&DB.live.timer.halfLen)||20);
+    const h=+d.h;
+    if(h===DB.live.half) return; /* already in this half — don't wipe the clock on a stray tap */
+    const t=DB.live.timer;
+    if(t && timerElapsedMs(t,Date.now())>0 && h<DB.live.half && !confirm('Go back to the 1st half? This resets the clock.')) return;
+    DB.live.half=h;
+    DB.live.timer=timerReset((t&&t.halfLen)||DEFAULT_HALF);
     save(); render();
   }
   if(a==='timer-toggle'){
-    const t=DB.live.timer||timerReset(30);
+    const t=DB.live.timer||timerReset(DEFAULT_HALF);
     DB.live.timer= t.running? timerPause(t) : timerStart(t);
     save(); render();
   }
   if(a==='timer-reset'){
     if(confirm('Reset the clock for this half?')){
-      DB.live.timer=timerReset((DB.live.timer&&DB.live.timer.halfLen)||20);
+      DB.live.timer=timerReset((DB.live.timer&&DB.live.timer.halfLen)||DEFAULT_HALF);
       save(); render();
     }
   }
   if(a==='timer-halflen'){
     const presets=[15,20,25,30,35];
-    const cur=(DB.live.timer&&DB.live.timer.halfLen)||20;
+    const cur=(DB.live.timer&&DB.live.timer.halfLen)||DEFAULT_HALF;
     const next=presets[(presets.indexOf(cur)+1)%presets.length];
-    DB.live.timer={...(DB.live.timer||timerReset(30)), halfLen:next};
+    DB.live.timer={...(DB.live.timer||timerReset(DEFAULT_HALF)), halfLen:next};
     save(); render();
   }
   if(a==='score'){openScorerPicker(d.type);}
-  if(a==='opp'){DB.live.events.push({t:Date.now(),half:DB.live.half,team:'them',type:d.type}); ensureTimerRunning(); save(); render();}
-  if(a==='team-ev'){DB.live.events.push({t:Date.now(),half:DB.live.half,team:'us',type:d.type}); ensureTimerRunning(); save(); render();}
+  if(a==='opp'){logEvent({team:'them',type:d.type}); save(); render();}
+  if(a==='team-ev'){logEvent({team:'us',type:d.type}); save(); render();}
   if(a==='stat-minus'){
     for(let i=DB.live.events.length-1;i>=0;i--){
       if(DB.live.events[i].type===d.type){DB.live.events.splice(i,1);break;}
@@ -1149,12 +1227,12 @@ setInterval(()=>{
     if(clockEl){
       const t=DB.live.timer;
       const elapsed=timerElapsedMs(t, Date.now());
-      const halfMs=(t.halfLen||30)*60*1000;
+      const halfMs=(t.halfLen||DEFAULT_HALF)*60*1000;
       const remaining=halfMs-elapsed;
       const over=remaining<0;
       clockEl.textContent=(over?'+':'')+timerFmt(Math.abs(remaining));
       clockEl.parentElement.classList.toggle('over', over);
-      if(subEl) subEl.textContent=(over?'into injury time':'remaining this half')+` · ${t.halfLen||30}min halves`;
+      if(subEl) subEl.textContent=(over?'into injury time':'remaining this half')+` · ${t.halfLen||DEFAULT_HALF}min halves`;
     }
   }
 }, 1000);
