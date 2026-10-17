@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>U16 Team Manager</title>
+<title>GnM U16 Team Manager</title>
 <link rel="manifest" href="./manifest.json">
 <meta name="theme-color" content="#6B1A2A">
 <link rel="icon" href="./icon-192.png">
@@ -253,14 +253,17 @@ async function load(){
   if(v){ try{ DB=Object.assign(DB, JSON.parse(v)); found=true; }catch(e){} }
   if(!found || !DB.players.length){ DB.players=SEED; save(); }
   if(DB.settings && DB.settings.sideline) document.body.classList.add('sideline');
+  /* live-match events need ids to sync one by one (older saves didn't have them) */
+  if(DB.live) DB.live.events.forEach(e=>{ if(!e.id) e.id=uid(); });
   render();
+  connectShared();
 }
 let saveTimer=null;
 async function flushSave(){
   clearTimeout(saveTimer); saveTimer=null;
   storageOK=await storSet(JSON.stringify(DB));
-  const sb=document.getElementById('savebar');
-  if(sb) sb.textContent= storageOK? 'Saved ✓' : 'Storage unavailable — data held in this session only';
+  pushShared();
+  updateSyncBar();
 }
 function save(){
   clearTimeout(saveTimer);
@@ -273,7 +276,7 @@ document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==
 window.addEventListener('pagehide', flushIfPending);
 /* ask the browser not to evict our data when the phone is low on space */
 try{ if(navigator.storage && navigator.storage.persist) navigator.storage.persist(); }catch(e){}
-if('serviceWorker' in navigator){ try{ navigator.serviceWorker.register('./sw.js'); }catch(e){} }
+if('serviceWorker' in navigator){ try{ navigator.serviceWorker.register('./sw.js').catch(()=>{}); }catch(e){} }
 
 /* keep the screen awake while a match is live, so the clock and buttons are
    there when you glance down — the browser drops the lock when the app is
@@ -290,6 +293,173 @@ async function syncWakeLock(){
 }
 document.addEventListener('visibilitychange', syncWakeLock);
 
+/* ================= SHARED SQUAD (coaches) =================
+   When the app is opened as a claude.ai artifact shared with the other
+   coaches, everything syncs live through the artifact's database. Each
+   player, session, test, saved match and live-match event is its own
+   document, so two coaches logging at the same time don't overwrite each
+   other. Opened anywhere else (the installed phone app) none of this runs
+   and the app works from this device's storage exactly as before; this
+   device's copy is also kept as an offline cache in shared mode.
+   SYNC.state: off | connecting | empty (shared squad has no data yet) |
+   live | readonly (view-only access) | error */
+const SYNC={state:'off', db:null, remote:{}, synced:{}, ready:new Set(), pending:new Map(), inflight:new Set(), deferred:false};
+const SHARED_COLLECTIONS=['players','sessions','tests','matches','liveEvents'];
+const clean=o=>JSON.parse(JSON.stringify(o));
+/* the app's data as {docPath: body} */
+function docsOf(D){
+  const out={};
+  D.players.forEach(p=>out['players/'+p.id]=p);
+  D.sessions.forEach(x=>out['sessions/'+x.id]=x);
+  D.tests.forEach(x=>out['tests/'+x.id]=x);
+  D.matches.forEach(x=>out['matches/'+x.id]=x);
+  if(D.live){
+    const {events, ...meta}=D.live;
+    out['live/current']=meta;
+    events.forEach(e=>out['liveEvents/'+e.id]=e);
+  }
+  return out;
+}
+function dbFromDocs(docs){
+  const D={players:[], sessions:[], tests:[], matches:[], live:null, settings:DB.settings};
+  const events=[];
+  Object.entries(docs).forEach(([path,v])=>{
+    const col=path.split('/')[0];
+    if(col==='liveEvents') events.push(v);
+    else if(col==='live') D.live={...v};
+    else if(D[col]) D[col].push(v);
+  });
+  if(D.live) D.live.events=events.sort((a,b)=>a.t-b.t);
+  return D;
+}
+function syncReady(){ return SYNC.ready.size===SHARED_COLLECTIONS.length+1; }
+async function connectShared(){
+  if(!window.claude || !window.claude.use) return;
+  SYNC.state='connecting'; updateSyncBar();
+  const db=await window.claude.use('db');
+  if(!db){ SYNC.state='off'; updateSyncBar(); return; }
+  SYNC.db=db;
+  try{
+    const user=await window.claude.use('user');
+    if(user && (await user.can('data.write'))===false) SYNC.readonly=true;
+  }catch(e){}
+  const fail=e=>{ SYNC.state='error'; SYNC.error=(e&&e.message)||'Connection lost'; updateSyncBar(); };
+  SHARED_COLLECTIONS.forEach(col=>{
+    db.collection(col).onSnapshot(snap=>{
+      Object.keys(SYNC.remote).forEach(k=>{ if(k.startsWith(col+'/')) delete SYNC.remote[k]; });
+      snap.docs.forEach(d=>{ SYNC.remote[col+'/'+d.id]=d.data(); });
+      SYNC.ready.add(col); onRemote();
+    }, fail);
+  });
+  db.doc('live/current').onSnapshot(snap=>{
+    if(snap.exists) SYNC.remote['live/current']=snap.data(); else delete SYNC.remote['live/current'];
+    SYNC.ready.add('live'); onRemote();
+  }, fail);
+}
+/* first full picture: adopt the shared squad (or offer to fill an empty one);
+   after that, fold in only what other coaches changed */
+function onRemote(){
+  if(!syncReady()) return;
+  if(SYNC.state==='connecting'){
+    if(!Object.keys(SYNC.remote).length){ SYNC.state=SYNC.readonly?'readonly':'empty'; render({keep:true}); return; }
+    SYNC.synced={};
+    Object.entries(SYNC.remote).forEach(([k,v])=>SYNC.synced[k]=JSON.stringify(v));
+    DB=dbFromDocs(clean(SYNC.remote));
+    SYNC.state=SYNC.readonly?'readonly':'live';
+    storSet(JSON.stringify(DB)); redraw(); return;
+  }
+  if(SYNC.state==='empty' && Object.keys(SYNC.remote).length){
+    /* another coach filled it first — switch over to theirs */
+    SYNC.state='connecting'; onRemote(); return;
+  }
+  if(SYNC.state!=='live' && SYNC.state!=='readonly') return;
+  const local=docsOf(DB);
+  let changed=false;
+  const paths=new Set([...Object.keys(SYNC.remote), ...Object.keys(SYNC.synced)]);
+  paths.forEach(p=>{
+    const r=SYNC.remote[p], rj= r===undefined? undefined : JSON.stringify(r);
+    if(rj===SYNC.synced[p]) return;  /* nobody else touched it */
+    if(SYNC.pending.has(p)||SYNC.inflight.has(p)) return; /* our own write is on its way */
+    if(r===undefined){ delete local[p]; delete SYNC.synced[p]; }
+    else { local[p]=clean(r); SYNC.synced[p]=rj; }
+    changed=true;
+  });
+  if(!changed) return;
+  DB=dbFromDocs(local);
+  storSet(JSON.stringify(DB)); redraw();
+}
+/* redraw for a remote change without wiping a half-filled form or an open picker */
+function redraw(){
+  if(document.getElementById('modal-root').innerHTML){ SYNC.deferred=true; return; }
+  render({keep:true});
+}
+/* send this device's changes: every doc whose body differs from what was last synced */
+function pushShared(){
+  if(SYNC.state!=='live' || !SYNC.db) return;
+  const local=docsOf(DB);
+  Object.entries(local).forEach(([p,v])=>{
+    const j=JSON.stringify(v);
+    if(SYNC.synced[p]!==j){ SYNC.synced[p]=j; SYNC.pending.set(p, clean(v)); }
+  });
+  Object.keys(SYNC.synced).forEach(p=>{
+    if(!(p in local)){ delete SYNC.synced[p]; SYNC.pending.set(p, null); }
+  });
+  pumpShared();
+}
+/* a few writes at a time, never two to the same document at once */
+function pumpShared(){
+  while(SYNC.inflight.size<4){
+    const p=[...SYNC.pending.keys()].find(k=>!SYNC.inflight.has(k));
+    if(!p) break;
+    const v=SYNC.pending.get(p); SYNC.pending.delete(p); SYNC.inflight.add(p);
+    const ref=SYNC.db.doc(p);
+    (v===null? ref.delete() : ref.set(v)).catch(e=>{
+      const code=e&&e.code;
+      if(code==='unavailable'||code==='resource_exhausted'){
+        if(!SYNC.pending.has(p)) setTimeout(()=>{ if(!SYNC.pending.has(p)){ SYNC.pending.set(p,v); pumpShared(); } }, 1500+Math.random()*1500);
+      } else if(code==='invalid_argument' && SYNC.state==='live'){
+        SYNC.readonly=true; SYNC.state='readonly';
+      } else if(code==='quota_exceeded'){
+        SYNC.error='Shared storage is full'; notify('Shared storage is full', 'This change was saved on this device only. Delete old test results or matches to make room.');
+      } else { SYNC.state='error'; SYNC.error=(e&&e.message)||'Sync failed'; }
+    }).finally(()=>{ SYNC.inflight.delete(p); pumpShared(); updateSyncBar(); });
+  }
+  updateSyncBar();
+}
+/* first coach in: put this device's squad into the empty shared store */
+function adoptShared(){
+  SYNC.state='live'; SYNC.synced={};
+  pushShared(); render();
+}
+function syncLabel(){
+  const n=SYNC.pending.size+SYNC.inflight.size;
+  return {
+    connecting:'Connecting to shared squad…',
+    empty:'Shared squad is empty',
+    live: n? `Syncing ${n} change${n===1?'':'s'}…` : 'Shared with coaches ✓',
+    readonly:'View only — your changes stay on this device',
+    error:`Sync problem: ${SYNC.error||'unknown'} — changes are kept on this device`,
+  }[SYNC.state]||'';
+}
+function updateSyncBar(){
+  const sb=document.getElementById('savebar');
+  if(!sb) return;
+  const local= storageOK? 'Saved ✓' : 'Storage unavailable — data held in this session only';
+  sb.textContent= SYNC.state==='off'? local : syncLabel();
+}
+function viewSharedCard(){
+  if(SYNC.state==='off') return '';
+  const body={
+    connecting:'<div class="empty">Connecting…</div>',
+    empty:`<div style="font-size:13px;color:var(--muted);margin-bottom:8px">Nobody has put a squad into the shared copy yet. If this device has the up-to-date squad (restore a backup or paste a sync code first if not), send it up and every coach will see it.</div>
+      <button class="btn-p btn-block" data-act="adopt-shared">⬆ Share this device's squad with the coaches</button>`,
+    live:`<div style="font-size:13px;color:var(--muted)">Players, attendance, testing and matches sync live with every coach who opens this page. Two of you can log the same match at once.</div>`,
+    readonly:`<div style="font-size:13px;color:var(--muted)">You can see the shared squad but not change it. Ask the owner to give you Contributor or Editor access.</div>`,
+    error:`<div style="font-size:13px;color:var(--bad)">${esc(SYNC.error||'Sync problem')}. Changes are being kept on this device; reload the page to reconnect.</div>`,
+  }[SYNC.state];
+  return `<div class="card"><h2>Shared Squad</h2>${body}</div>`;
+}
+
 /* ================= HELPERS ================= */
 /* LGFA positions: GK · corner backs + full back · wing backs + centre half-back · midfield · wing forwards + centre half-forward · corner forwards + full forward */
 const POS=['GK','CB','FB','WB','CHB','MF','WF','CHF','CF','FF'];
@@ -300,7 +470,9 @@ const AVAIL_LABEL={unset:'—', confirmed:'✓ In', doubtful:'? Doubt', out:'✕
 /* forwards first — scorers are usually up top */
 const POS_ORDER={FF:0,CF:1,CHF:2,WF:3,MF:4,'':4.5,CHB:5,WB:6,FB:7,CB:8,GK:9};
 const posRank=p=>POS_ORDER[p.pos]??4.5;
-const byAttack=(a,b)=> posRank(a)-posRank(b) || (a.num||99)-(b.num||99);
+/* jersey number, then name — shared-mode records arrive in no particular order */
+const byNum=(a,b)=> (a.num||99)-(b.num||99) || a.name.localeCompare(b.name);
+const byAttack=(a,b)=> posRank(a)-posRank(b) || byNum(a,b);
 function onPitch(L){
   const s=new Set(L.lineup);
   L.events.forEach(e=>{ if(e.type==='sub'){ s.delete(e.off); s.add(e.on); } });
@@ -341,8 +513,64 @@ function ensureTimerRunning(){
    (1-based, like a referee's watch: 0:00–0:59 is the 1st minute) */
 function logEvent(ev){
   ensureTimerRunning();
-  const min=Math.floor(timerElapsedMs(DB.live.timer, Date.now())/60000)+1;
-  DB.live.events.push({t:Date.now(), half:DB.live.half, min, ...ev});
+  const sec=Math.floor(timerElapsedMs(DB.live.timer, Date.now())/1000);
+  DB.live.events.push({id:uid(), t:Date.now(), half:DB.live.half, min:Math.floor(sec/60)+1, sec, ...ev});
+}
+/* remember how long a half actually ran (injury time included) for game-time totals */
+function recordHalfLength(L){
+  const sec=Math.floor(timerElapsedMs(L.timer, Date.now())/1000);
+  if(sec>0) L.halfSecs={...(L.halfSecs||{}), [L.half]:sec};
+}
+
+/* ================= GAME TIME =================
+   Minutes on the pitch per player for one match: starters from throw-in,
+   then each sub swaps the clock over. `nowSec` (seconds into the current
+   half) is passed for a live match; a saved match runs to full time.
+   Returns null for older matches whose subs weren't timed. */
+function gameTime(m, nowSec){
+  const subs=m.events.filter(e=>e.type==='sub');
+  if(subs.some(e=>e.sec==null && e.min==null)) return null;
+  const halfLen=((m.timer&&m.timer.halfLen)||DEFAULT_HALF)*60;
+  const len=h=> (m.halfSecs&&m.halfSecs[h]) || halfLen;
+  const at=(half,sec)=> (half===2? len(1) : 0) + sec;
+  const evSec=e=> e.sec!=null? e.sec : (e.min-1)*60;
+  /* a match saved without ever switching to the 2nd half ran on one clock */
+  const end= nowSec!=null? at(m.half, nowSec) : len(1) + (m.half===2? len(2) : 0);
+  const mins={}, onSince={};
+  (m.lineup||[]).forEach(id=>{ onSince[id]=0; });
+  subs.forEach(e=>{
+    const t=Math.min(at(e.half, evSec(e)), end);
+    if(e.off in onSince){ mins[e.off]=(mins[e.off]||0)+(t-onSince[e.off]); delete onSince[e.off]; }
+    if(e.on && !(e.on in onSince)) onSince[e.on]=t;
+  });
+  Object.entries(onSince).forEach(([id,t0])=>{ mins[id]=(mins[id]||0)+Math.max(0,end-t0); });
+  Object.keys(mins).forEach(id=>{ mins[id]=Math.round(mins[id]/60); });
+  return mins;
+}
+/* season game time per player across every timed match */
+function seasonGameTime(){
+  const tot={}; let untimed=0;
+  DB.matches.forEach(m=>{
+    const g=gameTime(m);
+    if(!g){ untimed++; return; }
+    Object.entries(g).forEach(([id,n])=>{
+      tot[id]=tot[id]||{mins:0, apps:0};
+      tot[id].mins+=n; tot[id].apps++;
+    });
+  });
+  return {tot, untimed};
+}
+/* every active player, including any with no minutes yet — empty if no match was timed */
+function gameTimeRows(gt){
+  if(DB.matches.length<=gt.untimed) return [];
+  return activePlayers().map(p=>({name:p.name, ...(gt.tot[p.id]||{mins:0,apps:0})}))
+    .sort((a,b)=>b.mins-a.mins || a.name.localeCompare(b.name));
+}
+function minutesLine(m){
+  const g=gameTime(m);
+  if(!g) return '';
+  const list=Object.entries(g).sort((a,b)=>b[1]-a[1]);
+  return `<b>Minutes:</b> ${list.map(([id,n])=>`${esc(playerName(id))} ${n}'`).join(', ')}<br>`;
 }
 const evWhen=e=>`H${e.half}${e.min?` ${e.min}'`:''}`;
 function renderTimer(t){
@@ -380,7 +608,14 @@ document.querySelectorAll('nav.tabs button').forEach(b=>{
   b.onclick=()=>{TAB=b.dataset.tab; render();};
 });
 
-function render(){
+/* render({keep:true}) carries over whatever is half-typed or half-ticked in
+   the current tab's forms — used when the page redraws for a reason other
+   than the user's own action (another coach's change, a filter toggle) */
+function render(opts){
+  const kept={};
+  if(opts&&opts.keep) document.querySelectorAll('#main input[id], #main select[id]').forEach(el=>{
+    kept[el.id]= el.type==='checkbox'? el.checked : el.value;
+  });
   document.querySelectorAll('nav.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.tab===TAB));
   const titles={squad:'Squad', sessions:'Training & Attendance', levels:'Testing', match:'Match Day', history:'Season History'};
   document.getElementById('hdr-title').textContent=titles[TAB];
@@ -391,14 +626,22 @@ function render(){
   if(TAB==='match') m.innerHTML=viewMatch();
   if(TAB==='history') m.innerHTML=viewHistory();
   m.insertAdjacentHTML('beforeend','<div class="savebar" id="savebar"></div>');
+  for(const [id,v] of Object.entries(kept)){
+    const el=document.getElementById(id);
+    if(!el) continue;
+    if(el.type==='checkbox') el.checked=v; else el.value=v;
+  }
   bind();
+  if(kept['lv-test']==='__c'){ const c=document.getElementById('lv-custom'); if(c) c.style.display='block'; }
+  updateSyncBar();
   syncWakeLock();
 }
 
 /* ================= SQUAD ================= */
 function viewSquad(){
-  const list=DB.players.filter(p=>!p.removed).sort((a,b)=>(a.num||99)-(b.num||99));
+  const list=DB.players.filter(p=>!p.removed).sort(byNum);
   return `
+  ${viewSharedCard()}
   <div class="card">
     <h2>Add Player</h2>
     <div class="row">
@@ -428,7 +671,9 @@ function viewSquad(){
   <div class="card">
     <h2>Backup</h2>
     ${backupNote()}
-    <div style="font-size:13px;color:var(--muted);margin-bottom:8px">Your data lives on this phone. Export a backup now and again (end of each month is plenty) — it downloads a file you can restore from if you ever change phone or clear the browser.</div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:8px">${SYNC.state==='live'
+      ? 'The shared squad is stored online with this page. A backup file is still a good safety net, and it is how you move the squad into the phone app.'
+      : 'Your data lives on this phone. Export a backup now and again (end of each month is plenty). It saves a file you can restore from if you change phone or clear the browser.'}</div>
     <div class="row">
       <button class="btn-ghost grow" data-act="export-data">⬇ Export backup</button>
       <button class="btn-ghost grow" data-act="import-data">⬆ Restore backup</button>
@@ -452,26 +697,51 @@ function backupNote(){
   return `<div style="font-size:13px;color:var(--bad);font-weight:700;margin-bottom:6px">⚠ ${days===null?'No backup taken yet':`Last backup ${days} days ago`} — export one now.</div>`;
 }
 function markBackedUp(){ DB.settings=DB.settings||{}; DB.settings.lastBackup=today(); save(); }
-function doExport(){
-  markBackedUp();
-  const blob=new Blob([JSON.stringify(DB,null,1)],{type:'application/json'});
+/* inside a claude.ai artifact, plain download links and the print dialog are
+   blocked; files go through the viewer's own save prompt instead */
+const IN_ARTIFACT=!!(window.claude && window.claude.use);
+async function saveFile(filename, text, type){
+  if(IN_ARTIFACT){
+    const dl=await window.claude.use('downloads');
+    if(!dl){ notify('Saving files is not available here', 'Use "Copy sync code" instead, or open the app on your phone.'); return false; }
+    try{ await dl.save({filename, data:new Blob([text],{type})}); return true; }
+    catch(e){ if(e&&e.code!=='declined') notify('File not saved', (e&&e.message)||''); return false; }
+  }
   const a=document.createElement('a');
-  a.href=URL.createObjectURL(blob);
-  a.download=`gnm-u16-backup-${today()}.json`;
+  a.href=URL.createObjectURL(new Blob([text],{type}));
+  a.download=filename;
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+  return true;
+}
+async function doExport(){
+  if(await saveFile(`gnm-u16-backup-${today()}.json`, JSON.stringify(DB,null,1), 'application/json')) markBackedUp();
+}
+/* the season report as its own page, to open and print from any browser */
+function seasonReportFile(){
+  const css=[...document.querySelectorAll('style')].map(s=>s.textContent).join('\n')
+    .match(/@media print\{([\s\S]*?)\n\}/);
+  const rules=(css? css[1] : '').replace(/body > \*:not\(#print-report\)\{[^}]*\}/,'');
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GnM U16 Season Report ${today()}</title><style>body{margin:0;font-family:Barlow,system-ui,sans-serif}${rules}</style></head>
+<body><div id="print-report">${buildSeasonReportHTML()}</div></body></html>`;
+}
+function confirmRestore(q, d){
+  const who= SYNC.state==='live'? 'for every coach on the shared squad' : 'in the app';
+  return ask(q, `This replaces everything currently ${who} with ${d.players.length} players, ${(d.matches||[]).length} matches and ${(d.sessions||[]).length} sessions.`, 'Replace everything', true);
+}
+function replaceAll(d){
+  DB=Object.assign({players:[],sessions:[],tests:[],matches:[],live:null}, d);
+  if(DB.live) DB.live.events.forEach(e=>{ if(!e.id) e.id=uid(); });
+  save();
 }
 function doImport(file){
   const r=new FileReader();
-  r.onload=()=>{
-    try{
-      const d=JSON.parse(r.result);
-      if(!d.players) throw 0;
-      if(confirm(`Restore backup? This replaces everything currently in the app (${d.players.length} players, ${(d.matches||[]).length} matches, ${(d.sessions||[]).length} sessions).`)){
-        DB=Object.assign({players:[],sessions:[],tests:[],matches:[],live:null}, d);
-        save(); render();
-      }
-    }catch(e){ alert('That file doesn\'t look like a valid backup.'); }
+  r.onload=async ()=>{
+    let d;
+    try{ d=JSON.parse(r.result); if(!d.players) throw 0; }
+    catch(e){ notify('Not a backup file', 'Pick a .json file made with "Export backup".'); return; }
+    if(await confirmRestore('Restore backup?', d)){ replaceAll(d); render(); }
   };
   r.readAsText(file);
 }
@@ -497,10 +767,7 @@ function decodeSyncCode(code){
 function buildSeasonReportHTML(){
   const logoSrc=(document.querySelector('header.app img')||{}).src||'';
   const totalSessions=DB.sessions.length;
-  const attRows=activePlayers().map(p=>{
-    const att=DB.sessions.filter(s=>s.present.includes(p.id)).length;
-    return {name:p.name, num:p.num, att, pct: totalSessions? Math.round(att/totalSessions*100):0};
-  }).sort((a,b)=>b.pct-a.pct);
+  const attRows=activePlayers().map(p=>({name:p.name, num:p.num, ...attendance(p, null)})).sort(byPct);
 
   const tally={};
   DB.matches.forEach(m=>m.events.forEach(e=>{
@@ -521,6 +788,8 @@ function buildSeasonReportHTML(){
   const record={W:0,L:0,D:0};
   matchRows.forEach(r=>record[r.res]++);
 
+  const gt=seasonGameTime(), gtRows=gameTimeRows(gt);
+
   // most recent result per test type per player
   const testTypes=[...new Set(DB.tests.map(t=>t.test))];
   const testRows=activePlayers().map(p=>{
@@ -540,7 +809,7 @@ function buildSeasonReportHTML(){
 
     <h2>Squad Attendance (${totalSessions} sessions logged)</h2>
     <table><tr><th>No.</th><th>Player</th><th>Sessions</th><th>%</th></tr>
-    ${attRows.map(r=>`<tr><td>${esc(r.num||'')}</td><td>${esc(r.name)}</td><td>${r.att}/${totalSessions}</td><td>${r.pct}%</td></tr>`).join('')}
+    ${attRows.map(r=>`<tr><td>${esc(r.num||'')}</td><td>${esc(r.name)}</td><td>${r.att}/${r.total}</td><td>${pctCell(r.pct)}</td></tr>`).join('')}
     </table>
 
     <h2>Match Results</h2>
@@ -553,6 +822,11 @@ function buildSeasonReportHTML(){
     ${scorerRows.map(r=>`<tr><td>${esc(r.name)}</td><td>${r.g}</td><td>${r.p1}</td><td>${r.p2}</td><td>${r.total}</td></tr>`).join('') || '<tr><td colspan="5">No scores recorded</td></tr>'}
     </table>
 
+    ${gtRows.length? `<h2>Game Time${gt.untimed?` (${gt.untimed} untimed match${gt.untimed===1?'':'es'} not counted)`:''}</h2>
+    <table><tr><th>Player</th><th>Appearances</th><th>Minutes</th><th>Avg / match</th></tr>
+    ${gtRows.map(r=>`<tr><td>${esc(r.name)}</td><td>${r.apps}</td><td>${r.mins}</td><td>${r.apps?Math.round(r.mins/r.apps):'—'}</td></tr>`).join('')}
+    </table>`:''}
+
     ${testRows.length? `<h2>Most Recent Fitness Testing</h2>
     <table><tr><th>Player</th>${testTypes.map(t=>`<th>${esc(t)}</th>`).join('')}</tr>
     ${testRows.map(r=>`<tr><td>${esc(r.name)}</td>${testTypes.map(t=>`<td>${r.latest[t]??'—'}</td>`).join('')}</tr>`).join('')}
@@ -561,17 +835,33 @@ function buildSeasonReportHTML(){
 }
 
 /* ================= SESSIONS ================= */
-let sessType='pitch', sessOpen=null, sessEdit=null;
+/* Attendance over sessions since `since` (YYYY-MM-DD, or null for the season).
+   Sessions before a player joined the panel don't count against her, unless
+   she was ticked at one anyway. pct is null when there's nothing to count. */
+function attendance(p, since){
+  const ss=DB.sessions.filter(s=> (!since||s.date>=since) && (!p.joined||s.date>=p.joined||s.present.includes(p.id)));
+  const att=ss.filter(s=>s.present.includes(p.id)).length;
+  return {att, total:ss.length, pct: ss.length? Math.round(att/ss.length*100) : null};
+}
+const byPct=(a,b)=>(b.pct??-1)-(a.pct??-1);
+const pctCell=pct=> pct===null? '—' : `${pct}%`;
+const pctColor=pct=> pct===null? 'var(--muted)' : pct>=70? 'var(--good)' : 'var(--bad)';
+const ATT_PERIODS={season:['Season',null], w8:['8 weeks',56], w4:['4 weeks',28]};
+function periodStart(key){
+  const days=ATT_PERIODS[key][1];
+  if(!days) return null;
+  const d=new Date(); d.setDate(d.getDate()-days);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+let sessType='pitch', sessOpen=null, sessEdit=null, attPeriod='season';
 function viewSessions(){
   const editing= sessEdit && DB.sessions.find(s=>s.id===sessEdit);
   if(!editing) sessEdit=null;
   const sessions=DB.sessions.slice().sort((a,b)=>b.date.localeCompare(a.date));
-  // attendance summary
-  const total=DB.sessions.length;
-  const rows=activePlayers().map(p=>{
-    const att=DB.sessions.filter(s=>s.present.includes(p.id)).length;
-    return {p,att,pct: total? Math.round(att/total*100):0};
-  }).sort((a,b)=>b.pct-a.pct);
+  // attendance summary for the chosen period
+  const since=periodStart(attPeriod);
+  const inPeriod=DB.sessions.filter(s=>!since||s.date>=since).length;
+  const rows=activePlayers().map(p=>({p, ...attendance(p, since)})).sort(byPct);
   return `
   <div class="card">
     <h2>${editing?'Edit Session':'New Session'}</h2>
@@ -582,7 +872,7 @@ function viewSessions(){
     </div>
     <label class="f">Who's here (${activePlayers().length} on panel)</label>
     <div id="ss-list">
-      ${activePlayers().sort((a,b)=>(a.num||99)-(b.num||99)).map(p=>`
+      ${activePlayers().sort(byNum).map(p=>`
         <div class="player-li">
           <input type="checkbox" class="chk ss-chk" value="${p.id}" id="c-${p.id}" ${editing&&editing.present.includes(p.id)?'checked':''}>
           <label for="c-${p.id}" class="grow" style="display:flex;align-items:center;margin-left:8px">
@@ -597,11 +887,16 @@ function viewSessions(){
     ${editing?'<button class="btn-ghost btn-block" style="margin-top:8px" data-act="sess-cancel">Cancel edit</button>':''}
   </div>
   <div class="card">
-    <h2>Attendance — Season</h2>
-    ${total? `<table><tr><th>Player</th><th class="num">Att.</th><th class="num">%</th></tr>
-      ${rows.map(r=>`<tr><td>${esc(r.p.name)}</td><td class="num">${r.att}/${total}</td>
-        <td class="num" style="color:${r.pct>=70?'var(--good)':'var(--bad)'};font-weight:700">${r.pct}%</td></tr>`).join('')}
-    </table>` : '<div class="empty">No sessions logged yet.</div>'}
+    <h2>Attendance</h2>
+    <div class="seg" id="att-period">
+      ${Object.entries(ATT_PERIODS).map(([k,[lb]])=>`<button data-p="${k}" class="${attPeriod===k?'on':''}">${lb}</button>`).join('')}
+    </div>
+    ${inPeriod? `<table><tr><th>Player</th><th class="num">Att.</th><th class="num">%</th></tr>
+      ${rows.map(r=>`<tr><td>${esc(r.p.name)}</td><td class="num">${r.att}/${r.total}</td>
+        <td class="num" style="color:${pctColor(r.pct)};font-weight:700">${pctCell(r.pct)}</td></tr>`).join('')}
+    </table>
+    <div style="font-size:12px;color:var(--muted);margin-top:6px">${inPeriod} session${inPeriod===1?'':'s'} in this period. Players added mid-season are only counted from the day they joined.</div>`
+    : `<div class="empty">${DB.sessions.length?'No sessions in this period.':'No sessions logged yet.'}</div>`}
   </div>
   <div class="card">
     <h2>Past Sessions (${sessions.length})</h2>
@@ -621,7 +916,7 @@ function viewSessions(){
 /* ================= LEVELS ================= */
 let lvlPlayer='';
 function viewLevels(){
-  const ps=activePlayers().sort((a,b)=>(a.num||99)-(b.num||99));
+  const ps=activePlayers().sort(byNum);
   if(!lvlPlayer && ps.length) lvlPlayer=ps[0].id;
   const entries=DB.tests.filter(t=>t.playerId===lvlPlayer).sort((a,b)=>a.date.localeCompare(b.date));
   const byTest={};
@@ -665,7 +960,7 @@ function viewMatch(){
 }
 function viewMatchSetup(){
   const availRank={confirmed:0, unset:1, doubtful:2, out:3};
-  const ps=activePlayers().sort((a,b)=> (availRank[a.avail||'unset']-availRank[b.avail||'unset']) || (a.num||99)-(b.num||99));
+  const ps=activePlayers().sort((a,b)=> (availRank[a.avail||'unset']-availRank[b.avail||'unset']) || byNum(a,b));
   return `
   <div class="card">
     <h2>Match Setup</h2>
@@ -763,6 +1058,8 @@ function viewLiveMatch(){
     </div>
   </div>
 
+  ${viewLiveGameTime(L)}
+
   <div class="card">
     <h2>Event Log <span style="font-size:12px;color:var(--muted);text-transform:none;font-weight:400">— tap any line to edit or delete</span></h2>
     <div class="eventlog">
@@ -774,6 +1071,23 @@ function viewLiveMatch(){
     </div>
   </div>`;
 }
+/* who's had how long so far — least first, so it's easy to see who needs a run */
+function viewLiveGameTime(L){
+  const g=gameTime(L, Math.floor(timerElapsedMs(L.timer||timerReset(DEFAULT_HALF), Date.now())/1000));
+  if(!g) return '';
+  const pitch=onPitch(L);
+  const row=p=>`<div class="player-li" style="padding:5px 2px"><span class="tag-num">${esc(p.num)||'–'}</span><span class="nm grow">${esc(p.name)}</span><b style="color:var(--maroon)">${g[p.id]||0}'</b></div>`;
+  const byMins=(a,b)=>(g[a.id]||0)-(g[b.id]||0) || byNum(a,b);
+  const on=activePlayers().filter(p=>pitch.has(p.id)).sort(byMins);
+  const bench=activePlayers().filter(p=>!pitch.has(p.id) && p.avail!=='out').sort(byMins);
+  return `<div class="card">
+    <div class="hist-head" data-act="toggle-gt"><h2 style="margin:0">Game Time</h2><span style="color:var(--muted)">${showGT?'▲':'▼'}</span></div>
+    ${showGT? `<h3>On the pitch</h3>${on.map(row).join('')||'<div class="empty">No starting team picked.</div>'}
+      ${bench.length? `<h3>Bench</h3>${bench.map(row).join('')}`:''}
+      <div style="font-size:12px;color:var(--muted);margin-top:6px">Updates each time something is logged.</div>`:''}
+  </div>`;
+}
+let showGT=false;
 function evLabel(e){
   if(e.type==='sub') return `🔁 Sub: ${esc(playerName(e.on))} on for ${esc(playerName(e.off))}`;
   const who=e.team==='them'? (DB.live? DB.live.opponent:'Opp') : (e.playerId? `${playerNum(e.playerId)? '#'+playerNum(e.playerId)+' ':''}${playerName(e.playerId)}` : 'Team');
@@ -841,7 +1155,7 @@ function openSubPicker(){
   const pitch=onPitch(L);
   const on=activePlayers().filter(p=>pitch.has(p.id)).sort(byAttack);
   const bench=activePlayers().filter(p=>!pitch.has(p.id)).sort(byAttack);
-  if(!bench.length){alert('No one left on the bench.'); return;}
+  if(!bench.length){notify('No one left on the bench'); return;}
   const li=(p,attr)=>`<button data-${attr}="${p.id}"><span class="tag-num">${esc(p.num)||'–'}</span>${esc(p.name)}${p.pos?` <span style="color:var(--muted);font-weight:400">${esc(p.pos)}</span>`:''}</button>`;
   showSheet(`<h3>Substitution — who's coming off?</h3>
     <div class="picker">${on.map(p=>li(p,'off')).join('')}</div>`,
@@ -878,11 +1192,7 @@ function viewHistory(){
   })).sort((a,b)=>b.total-a.total);
 
   // dashboard: attendance leaders + match appearances (starts + sub-appearances), season to date
-  const totalSessions=DB.sessions.length;
-  const attRows=activePlayers().map(p=>{
-    const att=DB.sessions.filter(s=>s.present.includes(p.id)).length;
-    return {name:p.name, pct: totalSessions? Math.round(att/totalSessions*100):0};
-  }).sort((a,b)=>b.pct-a.pct).slice(0,5);
+  const attRows= DB.sessions.length? activePlayers().map(p=>({name:p.name, ...attendance(p, null)})).sort(byPct).slice(0,5) : [];
   const appCount={};
   ms.forEach(m=>{
     (m.lineup||[]).forEach(id=> appCount[id]=(appCount[id]||0)+1);
@@ -890,6 +1200,7 @@ function viewHistory(){
       if(!(m.lineup||[]).includes(id)) appCount[id]=(appCount[id]||0)+1;
     });
   });
+  const gt=seasonGameTime(), gtRows=gameTimeRows(gt);
   const appRows=Object.entries(appCount).map(([id,n])=>({name:playerName(id), n}))
     .sort((a,b)=>b.n-a.n).slice(0,5);
 
@@ -897,12 +1208,17 @@ function viewHistory(){
   <div class="card">
     <h2>Season Dashboard</h2>
     <h3>Attendance Leaders</h3>
-    ${attRows.length? attRows.map(r=>`<div class="player-li"><span class="nm grow">${esc(r.name)}</span><span style="font-weight:700;color:${r.pct>=70?'var(--good)':'var(--bad)'}">${r.pct}%</span></div>`).join('')
+    ${attRows.length? attRows.map(r=>`<div class="player-li"><span class="nm grow">${esc(r.name)}</span><span style="font-weight:700;color:${pctColor(r.pct)}">${pctCell(r.pct)}</span></div>`).join('')
       : '<div class="empty">No sessions logged yet.</div>'}
     <h3>Match Appearances</h3>
     ${appRows.length? appRows.map(r=>`<div class="player-li"><span class="nm grow">${esc(r.name)}</span><span style="font-weight:700;color:var(--maroon)">${r.n}</span></div>`).join('')
       : '<div class="empty">No matches saved yet.</div>'}
-    <button class="btn-ghost btn-block" style="margin-top:12px" data-act="print-report">🖨 Print / Save Season Report as PDF</button>
+    <h3>Game Time</h3>
+    ${gtRows.length? `<table><tr><th>Player</th><th class="num">Apps</th><th class="num">Mins</th><th class="num">Avg</th></tr>
+      ${gtRows.map(r=>`<tr><td>${esc(r.name)}</td><td class="num">${r.apps}</td><td class="num" style="font-weight:700">${r.mins}</td><td class="num">${r.apps?Math.round(r.mins/r.apps):'—'}</td></tr>`).join('')}</table>
+      ${gt.untimed?`<div style="font-size:12px;color:var(--muted);margin-top:6px">${gt.untimed} older match${gt.untimed===1?'':'es'} without sub timings not counted.</div>`:''}`
+      : '<div class="empty">No timed matches saved yet.</div>'}
+    <button class="btn-ghost btn-block" style="margin-top:12px" data-act="print-report">${IN_ARTIFACT?'⬇ Download Season Report':'🖨 Print / Save Season Report as PDF'}</button>
   </div>
   <div class="card">
     <h2>Top Scorers — Season</h2>
@@ -929,6 +1245,7 @@ function viewHistory(){
       ${histOpen===m.id? `<div style="font-size:14px;padding:8px 2px;border-top:1px dashed var(--line);margin-top:8px">
         <b>Scorers:</b> ${Object.entries(scorers).map(([k,s])=>`${esc(k==='__t'?'Team':playerName(k))} ${s.g}-${String(s.p).padStart(2,'0')}`).join(', ')||'none'}<br>
         ${m.events.some(e=>e.type==='sub')? `<b>Subs:</b> ${m.events.filter(e=>e.type==='sub').map(e=>`${esc(playerName(e.on))} for ${esc(playerName(e.off))}`).join(', ')}<br>`:''}
+        ${minutesLine(m)}
         <b>Stats:</b> KO won ${c('ko_won')} · KO lost ${c('ko_lost')} · Marks ${c('ko_mark')} · Turnovers ${c('turnover')} · Frees won ${c('free_won')} · Frees conc. ${c('free_con')} · Wides ${c('wide')}
         <div style="margin-top:8px" class="row">
           <button class="btn-sm btn-s grow" data-act="copy-match" data-id="${m.id}">📋 Copy report</button>
@@ -1015,12 +1332,45 @@ function copyText(txt, btn){
 }
 function fallbackCopy(txt,done){
   const ta=document.createElement('textarea'); ta.value=txt; document.body.appendChild(ta);
-  ta.select(); try{document.execCommand('copy'); done();}catch(e){alert(txt);} 
+  ta.select(); let ok=false; try{ ok=document.execCommand('copy'); }catch(e){}
+  if(ok) done(); else showSheet(`<h3>Copy this</h3><textarea rows="10" style="width:100%;font-size:13px;padding:8px;border:1.5px solid var(--line);border-radius:8px" readonly>${esc(txt)}</textarea>`);
   document.body.removeChild(ta);
 }
 
-/* ================= SHEET / MODAL ================= */
+/* ================= SHEET / MODAL =================
+   In-app dialogs instead of the browser's confirm()/prompt()/alert(): those
+   are blocked inside a claude.ai artifact (confirm() just answers "no"), and
+   these match the rest of the app on the phone too. */
+function ask(title, msg, ok='OK', danger=false){
+  return new Promise(res=>{
+    showSheet(`<h3>${esc(title)}</h3>${msg?`<p style="margin:0 0 12px;font-size:15px">${esc(msg)}</p>`:''}
+      <button class="${danger?'btn-danger':'btn-p'} btn-block" id="ask-ok">${esc(ok)}</button>`, root=>{
+      sheetOnClose=()=>res(false);
+      root.querySelector('#ask-ok').onclick=()=>{ sheetOnClose=null; closeSheet(); res(true); };
+    });
+  });
+}
+function askText(title, value, inputmode='text'){
+  return new Promise(res=>{
+    showSheet(`<h3>${esc(title)}</h3>
+      <input id="ask-val" inputmode="${inputmode}" value="${esc(value)}">
+      <button class="btn-p btn-block" style="margin-top:10px" id="ask-ok">Save</button>`, root=>{
+      sheetOnClose=()=>res(null);
+      const inp=root.querySelector('#ask-val'); inp.focus(); inp.select();
+      const done=()=>{ sheetOnClose=null; const v=inp.value; closeSheet(); res(v); };
+      root.querySelector('#ask-ok').onclick=done;
+      inp.onkeydown=e=>{ if(e.key==='Enter') done(); };
+    });
+  });
+}
+function notify(title, msg){
+  showSheet(`<h3>${esc(title)}</h3>${msg?`<p style="margin:0;font-size:15px">${esc(msg)}</p>`:''}`);
+  document.getElementById('sheet-close').textContent='OK';
+}
+/* runs when a sheet is dismissed (Cancel, tap outside, or replaced by another) */
+let sheetOnClose=null;
 function showSheet(html, after){
+  const prev=sheetOnClose; sheetOnClose=null; if(prev) prev();
   const root=document.getElementById('modal-root');
   root.innerHTML=`<div class="overlay" id="ov"><div class="sheet">${html}
     <button class="btn-ghost btn-block" style="margin-top:6px" id="sheet-close">Cancel</button></div></div>`;
@@ -1028,7 +1378,12 @@ function showSheet(html, after){
   document.getElementById('ov').onclick=e=>{if(e.target.id==='ov')closeSheet();};
   if(after) after(root);
 }
-function closeSheet(){document.getElementById('modal-root').innerHTML='';}
+function closeSheet(){
+  document.getElementById('modal-root').innerHTML='';
+  const f=sheetOnClose; sheetOnClose=null; if(f) f();
+  /* a remote change arrived while the picker was open — draw it now */
+  if(SYNC.deferred){ SYNC.deferred=false; render({keep:true}); }
+}
 
 /* ================= EVENTS ================= */
 function bind(){
@@ -1037,6 +1392,8 @@ function bind(){
   });
   const st=document.getElementById('ss-type');
   if(st) st.querySelectorAll('button').forEach(b=>b.onclick=()=>{sessType=b.dataset.t; st.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));});
+  const ap=document.getElementById('att-period');
+  if(ap) ap.querySelectorAll('button').forEach(b=>b.onclick=()=>{attPeriod=b.dataset.p; render({keep:true});});
   const lp=document.getElementById('lv-player');
   if(lp) lp.onchange=()=>{lvlPlayer=lp.value; render();};
   const lt=document.getElementById('lv-test');
@@ -1046,16 +1403,17 @@ function bind(){
     document.getElementById('mt-count').textContent=pickLineup.size;
   });
 }
-function handle(d, el){
+async function handle(d, el){
   const a=d.act;
   if(a==='add-player'){
     const name=document.getElementById('np-name').value.trim();
     if(!name) return;
     DB.players.push({id:uid(), name, num:+document.getElementById('np-num').value||null,
-      pos:document.getElementById('np-pos').value, active:true});
+      pos:document.getElementById('np-pos').value, active:true, joined:today()});
     save(); render();
   }
   if(a==='export-data'){doExport();}
+  if(a==='adopt-shared'){ if(await ask('Share this squad?', `${activePlayers().length} active players, ${DB.sessions.length} sessions and ${DB.matches.length} matches go up to the shared copy for every coach.`, 'Share with coaches')) adoptShared(); }
   if(a==='toggle-sideline'){
     DB.settings=DB.settings||{};
     DB.settings.sideline=!DB.settings.sideline;
@@ -1063,6 +1421,7 @@ function handle(d, el){
     save(); render();
   }
   if(a==='copy-sync'){ markBackedUp(); copyText(encodeSyncCode(), el); }
+  if(a==='print-report' && IN_ARTIFACT){ saveFile(`gnm-u16-season-report-${today()}.html`, seasonReportFile(), 'text/html'); return; }
   if(a==='print-report'){
     document.getElementById('print-report').innerHTML=buildSeasonReportHTML();
     setTimeout(()=>window.print(), 80);
@@ -1071,14 +1430,11 @@ function handle(d, el){
     showSheet(`<h3>Paste Sync Code</h3>
       <textarea id="sync-paste" rows="6" style="width:100%;font-family:monospace;font-size:12px;padding:8px;border:1.5px solid var(--line);border-radius:8px" placeholder="Paste the GNM1:... code here"></textarea>
       <button class="btn-p btn-block" style="margin-top:10px" id="sync-apply">Restore from code</button>`,
-      root=>{ document.getElementById('sync-apply').onclick=()=>{
-        try{
-          const d=decodeSyncCode(document.getElementById('sync-paste').value);
-          if(confirm(`Restore from this code? This replaces everything currently in the app (${d.players.length} players, ${(d.matches||[]).length} matches, ${(d.sessions||[]).length} sessions).`)){
-            DB=Object.assign({players:[],sessions:[],tests:[],matches:[],live:null}, d);
-            save(); closeSheet(); render();
-          }
-        }catch(e){ alert(e.message||'That doesn\'t look like a valid sync code.'); }
+      root=>{ document.getElementById('sync-apply').onclick=async ()=>{
+        let d;
+        try{ d=decodeSyncCode(document.getElementById('sync-paste').value); }
+        catch(e){ notify('Not a sync code', 'Paste the whole code, starting with GNM1:'); return; }
+        if(await confirmRestore('Restore from this code?', d)){ replaceAll(d); render(); }
       };});
   }
   if(a==='import-data'){
@@ -1096,14 +1452,14 @@ function handle(d, el){
   }
   if(a==='edit-num'){
     const p=DB.players.find(p=>p.id===d.id);
-    const v=prompt(`Jersey number for ${p.name}:`, p.num||'');
+    const v=await askText(`Jersey number for ${p.name}`, p.num||'', 'numeric');
     if(v!==null){ p.num=parseInt(v)||null; save(); render(); }
   }
   if(a==='del-player'){
     /* hidden rather than deleted, so saved matches, scorer tables and the
        season report still show their name instead of "Team" */
     const p=DB.players.find(p=>p.id===d.id);
-    if(confirm(`Remove ${p.name} from the squad? Their goals, appearances and attendance stay in saved matches and reports.`)){
+    if(await ask(`Remove ${p.name}?`, 'Her goals, appearances and attendance stay in saved matches and reports.', 'Remove from squad', true)){
       p.removed=true; p.active=false; delete p.avail; save(); render();
     }
   }
@@ -1120,7 +1476,7 @@ function handle(d, el){
       sessOpen=ex.id; sessEdit=null; sessType='pitch';
     }
     else{
-      if(!present.length && !confirm('Nobody is ticked — save an empty session?')) return;
+      if(!present.length && !(await ask('Nobody is ticked', 'Save this session with nobody marked present?', 'Save anyway'))) return;
       DB.sessions.push({id:uid(), date, type:sessType, present});
     }
     save(); render();
@@ -1131,9 +1487,9 @@ function handle(d, el){
   }
   if(a==='sess-cancel'){ sessEdit=null; sessType='pitch'; render(); }
   if(a==='open-sess'){sessOpen= sessOpen===d.id? null : d.id; render();}
-  if(a==='del-sess'){ if(confirm('Delete this session? Attendance figures will be recalculated.')){ DB.sessions=DB.sessions.filter(s=>s.id!==d.id); if(sessEdit===d.id) sessEdit=null; save(); render(); } }
+  if(a==='del-sess'){ if(await ask('Delete this session?', 'Attendance figures will be recalculated.', 'Delete session', true)){ DB.sessions=DB.sessions.filter(s=>s.id!==d.id); if(sessEdit===d.id) sessEdit=null; save(); render(); } }
   if(a==='del-test'){
-    if(confirm('Delete this test result?')){
+    if(await ask('Delete this test result?', '', 'Delete', true)){
       DB.tests=DB.tests.filter(t=>t.id!==d.id); save(); render();
     }
   }
@@ -1148,10 +1504,9 @@ function handle(d, el){
   }
   if(a==='start-match'){
     const opp=document.getElementById('mt-opp').value.trim();
-    if(!opp){alert('Who are we playing?'); return;}
-    if(pickLineup.size!==15 && !confirm(pickLineup.size?
-      `You've picked ${pickLineup.size} starters, not 15. Start anyway?` :
-      'No starting team picked — subs and "who scored" lists won\'t know who\'s on the pitch. Start anyway?')) return;
+    if(!opp){notify('Who are we playing?', 'Enter the opposition first.'); return;}
+    if(pickLineup.size!==15 && !(await ask(pickLineup.size? `${pickLineup.size} starters picked` : 'No starting team picked',
+      pickLineup.size? 'You have not picked 15. Start the match anyway?' : 'Subs, game time and the "who scored" list won\'t know who is on the pitch.', 'Start anyway'))) return;
     DB.live={id:uid(), date:document.getElementById('mt-date').value||today(), opponent:opp,
       comp:document.getElementById('mt-comp').value, lineup:[...pickLineup], half:1, events:[],
       timer:timerReset(DEFAULT_HALF)};
@@ -1173,7 +1528,8 @@ function handle(d, el){
     const h=+d.h;
     if(h===DB.live.half) return; /* already in this half — don't wipe the clock on a stray tap */
     const t=DB.live.timer;
-    if(t && timerElapsedMs(t,Date.now())>0 && h<DB.live.half && !confirm('Go back to the 1st half? This resets the clock.')) return;
+    if(t && timerElapsedMs(t,Date.now())>0 && h<DB.live.half && !(await ask('Go back to the 1st half?', 'This resets the clock.', 'Go back'))) return;
+    if(h>DB.live.half) recordHalfLength(DB.live);
     DB.live.half=h;
     DB.live.timer=timerReset((t&&t.halfLen)||DEFAULT_HALF);
     save(); render();
@@ -1184,7 +1540,7 @@ function handle(d, el){
     save(); render();
   }
   if(a==='timer-reset'){
-    if(confirm('Reset the clock for this half?')){
+    if(await ask('Reset the clock for this half?', '', 'Reset clock', true)){
       DB.live.timer=timerReset((DB.live.timer&&DB.live.timer.halfLen)||DEFAULT_HALF);
       save(); render();
     }
@@ -1207,15 +1563,16 @@ function handle(d, el){
   }
   if(a==='undo'){DB.live.events.pop(); save(); render();}
   if(a==='edit-event'){openEventEditor(+d.idx);}
-  if(a==='abandon'){if(confirm('Discard this match entirely?')){DB.live=null; save(); render();}}
+  if(a==='abandon'){if(await ask('Discard this match?', 'Every score and stat logged so far is deleted.', 'Discard match', true)){DB.live=null; save(); render();}}
   if(a==='end-match'){
-    if(confirm('Full time — save this match to history?')){
-      const m=DB.live; m.status='final'; DB.matches.push(m); DB.live=null;
+    if(await ask('Full time?', 'Save this match to the season history.', 'Save match')){
+      const m=DB.live; recordHalfLength(m); m.status='final'; DB.matches.push(m); DB.live=null;
       save(); TAB='history'; render();
     }
   }
+  if(a==='toggle-gt'){showGT=!showGT; render();}
   if(a==='open-hist'){histOpen= histOpen===d.id? null : d.id; render();}
-  if(a==='del-match'){if(confirm('Delete this match record?')){DB.matches=DB.matches.filter(m=>m.id!==d.id); save(); render();}}
+  if(a==='del-match'){if(await ask('Delete this match?', 'Its scores, subs and game time are removed from the season.', 'Delete match', true)){DB.matches=DB.matches.filter(m=>m.id!==d.id); save(); render();}}
 }
 
 /* Update just the on-screen clock every second while a timer is running —
