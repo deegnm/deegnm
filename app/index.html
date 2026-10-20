@@ -478,8 +478,27 @@ function onPitch(L){
   L.events.forEach(e=>{ if(e.type==='sub'){ s.delete(e.off); s.add(e.on); } });
   return s;
 }
-const TESTS=['20m Sprint (s)','Press-ups (Max)','Plank (s)','Kicking accuracy /5','7 Minute Endurance'];
-const LOWER_BETTER=t=>/sprint|5-10-5/i.test(t);
+/* Fitness tests from the U16 Girls Winter Programme coach guide (p.13), run on
+   the same two Thursdays so results compare fairly. 5-0-5 is recorded per foot.
+   The bleep test is kept as level + shuttle: typed as one decimal, level 7
+   shuttle 10 ("7.10") would rank below 7.9, so `value` is level + shuttle/100
+   purely for ordering and the pair is what gets shown. Results logged under
+   older test names stay and still show in progress and reports. */
+const TESTS=[
+  {name:'20m Sprint (s)',      unit:'s',  lower:true,  hint:'Best of 2 attempts, to 0.01 sec'},
+  {name:'Broad Jump (cm)',     unit:'cm', lower:false, hint:'Best of 3 attempts. A fall or step back is re-done'},
+  {name:'5-0-5 Left Foot (s)', unit:'s',  lower:true,  hint:'Best of 2, turning off the left foot'},
+  {name:'5-0-5 Right Foot (s)',unit:'s',  lower:true,  hint:'Best of 2, turning off the right foot'},
+  {name:'Bleep Test',          bleep:true,lower:false, hint:'Level and shuttle reached (e.g. 7.4). Do it last'},
+];
+const TEST_DAYS=[{label:'Week 1 baseline', date:'2026-11-19'}, {label:'Week 14 retest', date:'2027-03-04'}];
+const isBleep=t=>/bleep/i.test(t);
+const LOWER_BETTER=t=>{ const d=TESTS.find(x=>x.name===t); return d? d.lower : /sprint|5-0-5|5-10-5/i.test(t); };
+/* how a result reads on screen: bleep as level.shuttle, everything else as entered */
+function fmtResult(e){
+  if(e.level!=null) return `${e.level}.${e.shuttle}`;
+  return String(e.value);
+}
 const activePlayers=()=>DB.players.filter(p=>p.active);
 const playerName=id=>{const p=DB.players.find(p=>p.id===id); return p? p.name : 'Team';};
 const playerNum=id=>{const p=DB.players.find(p=>p.id===id); return p? p.num : '';};
@@ -632,7 +651,6 @@ function render(opts){
     if(el.type==='checkbox') el.checked=v; else el.value=v;
   }
   bind();
-  if(kept['lv-test']==='__c'){ const c=document.getElementById('lv-custom'); if(c) c.style.display='block'; }
   updateSyncBar();
   syncWakeLock();
 }
@@ -790,16 +808,10 @@ function buildSeasonReportHTML(){
 
   const gt=seasonGameTime(), gtRows=gameTimeRows(gt);
 
-  // most recent result per test type per player
-  const testTypes=[...new Set(DB.tests.map(t=>t.test))];
-  const testRows=activePlayers().map(p=>{
-    const latest={};
-    testTypes.forEach(t=>{
-      const entries=DB.tests.filter(e=>e.playerId===p.id&&e.test===t).sort((a,b)=>a.date.localeCompare(b.date));
-      if(entries.length) latest[t]=entries[entries.length-1].value;
-    });
-    return {name:p.name, latest};
-  }).filter(r=>Object.keys(r.latest).length);
+  // first and most recent result per test, like the coach guide's results sheet
+  const testTypes=testColumns();
+  const testRows=activePlayers().map(p=>({name:p.name, cells:testTypes.map(t=>firstLatest(p.id,t))}))
+    .filter(r=>r.cells.some(Boolean));
 
   return `
     ${logoSrc?`<img class="rep-logo" src="${logoSrc}">`:''}
@@ -827,9 +839,9 @@ function buildSeasonReportHTML(){
     ${gtRows.map(r=>`<tr><td>${esc(r.name)}</td><td>${r.apps}</td><td>${r.mins}</td><td>${r.apps?Math.round(r.mins/r.apps):'—'}</td></tr>`).join('')}
     </table>`:''}
 
-    ${testRows.length? `<h2>Most Recent Fitness Testing</h2>
+    ${testRows.length? `<h2>Fitness Testing (first → latest)</h2>
     <table><tr><th>Player</th>${testTypes.map(t=>`<th>${esc(t)}</th>`).join('')}</tr>
-    ${testRows.map(r=>`<tr><td>${esc(r.name)}</td>${testTypes.map(t=>`<td>${r.latest[t]??'—'}</td>`).join('')}</tr>`).join('')}
+    ${testRows.map(r=>`<tr><td>${esc(r.name)}</td>${r.cells.map((fl,i)=>`<td>${firstLatestCell(fl,testTypes[i])}</td>`).join('')}</tr>`).join('')}
     </table>`:''}
   `;
 }
@@ -914,41 +926,85 @@ function viewSessions(){
 }
 
 /* ================= LEVELS ================= */
-let lvlPlayer='';
+let lvlPlayer='', lvlTest='0';
+/* results typed on the Test Day list, kept while switching between tests until saved */
+const testDraft={};
+const draftVal=id=>esc(testDraft[id]||'');
+/* every player's first and most recent result for one test (null if none) */
+function firstLatest(pid, test){
+  const arr=DB.tests.filter(e=>e.playerId===pid && e.test===test).sort((a,b)=>a.date.localeCompare(b.date));
+  return arr.length? {first:arr[0], latest:arr[arr.length-1], n:arr.length} : null;
+}
+/* the guide's tests first, then any other test that has results (older or custom ones) */
+function testColumns(){
+  const used=new Set(DB.tests.map(t=>t.test));
+  return [...TESTS.map(t=>t.name).filter(n=>used.has(n)), ...[...used].filter(n=>!TESTS.some(t=>t.name===n))];
+}
+/* "2.85 → 2.71" coloured by whether she improved on her own first result */
+function firstLatestCell(fl, test){
+  if(!fl) return '—';
+  if(fl.n===1) return esc(fmtResult(fl.first));
+  const d=fl.latest.value-fl.first.value;
+  const cls= d===0? '' : ((LOWER_BETTER(test)? d<0 : d>0)? 'delta-up':'delta-dn');
+  return `${esc(fmtResult(fl.first))} → <span class="${cls}">${esc(fmtResult(fl.latest))}</span>`;
+}
 function viewLevels(){
   const ps=activePlayers().sort(byNum);
   if(!lvlPlayer && ps.length) lvlPlayer=ps[0].id;
+  const custom= lvlTest==='__c';
+  const def= custom? null : TESTS[+lvlTest];
+  const bleep= !!(def && def.bleep);
+  const key= custom? 'c' : lvlTest;
+  const unit= def? (def.unit||'') : '';
+  const entryRow=p=>`
+    <div class="player-li" style="gap:8px">
+      <span class="tag-num">${esc(p.num)||'–'}</span><span class="nm grow" style="min-width:0">${esc(p.name)}</span>
+      ${bleep
+        ? `<input id="lv-b-${p.id}-l" class="lv-entry" value="${draftVal(`lv-b-${p.id}-l`)}" type="number" min="1" max="21" inputmode="numeric" placeholder="Lvl" style="width:64px" aria-label="${esc(p.name)} level">
+           <input id="lv-b-${p.id}-s" class="lv-entry" value="${draftVal(`lv-b-${p.id}-s`)}" type="number" min="1" max="16" inputmode="numeric" placeholder="Sh" style="width:64px" aria-label="${esc(p.name)} shuttle">`
+        : `<input id="lv-${key}-${p.id}" class="lv-entry" value="${draftVal(`lv-${key}-${p.id}`)}" type="number" step="0.01" inputmode="decimal" placeholder="${esc(unit)}" style="width:96px" aria-label="${esc(p.name)} result">`}
+    </div>`;
   const entries=DB.tests.filter(t=>t.playerId===lvlPlayer).sort((a,b)=>a.date.localeCompare(b.date));
   const byTest={};
   entries.forEach(e=>{(byTest[e.test]=byTest[e.test]||[]).push(e);});
+  const cols=testColumns();
   return `
   <div class="card">
-    <h2>Log a Test Result</h2>
-    <label class="f">Player</label>
-    <select id="lv-player">${ps.map(p=>`<option value="${p.id}" ${p.id===lvlPlayer?'selected':''}>${esc(p.num||'')} ${esc(p.name)}</option>`).join('')}</select>
+    <h2>Test Day</h2>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:4px">${TEST_DAYS.map(d=>`${d.label}: <b>${fmtDate(d.date)}</b>`).join(' · ')}. Same tests, same order, same surface both times. Bleep test last.</div>
     <label class="f">Test</label>
-    <select id="lv-test">${TESTS.map(t=>`<option>${t}</option>`).join('')}<option value="__c">Custom…</option></select>
-    <input id="lv-custom" placeholder="Custom test name" style="display:none;margin-top:6px">
-    <div class="row" style="margin-top:6px">
-      <div class="grow"><label class="f">Result</label><input id="lv-val" type="number" step="0.01" inputmode="decimal"></div>
-      <div class="grow"><label class="f">Date</label><input id="lv-date" type="date" value="${today()}"></div>
-    </div>
-    <div style="margin-top:10px"><button class="btn-p btn-block" data-act="add-test">Save result</button></div>
+    <select id="lv-test">${TESTS.map((t,i)=>`<option value="${i}" ${String(i)===lvlTest?'selected':''}>${esc(t.name)}</option>`).join('')}<option value="__c" ${custom?'selected':''}>Custom…</option></select>
+    <input id="lv-custom" placeholder="Custom test name" style="display:${custom?'block':'none'};margin-top:6px">
+    ${def? `<div style="font-size:13px;color:var(--muted);margin-top:6px">${esc(def.hint)}</div>`:''}
+    <label class="f">Date</label><input id="lv-date" type="date" value="${today()}">
+    <label class="f">Results — fill in whoever did the test, leave the rest blank</label>
+    ${ps.map(entryRow).join('') || '<div class="empty">Add players in the Squad tab first.</div>'}
+    <div style="margin-top:10px"><button class="btn-p btn-block" data-act="save-tests">Save results</button></div>
   </div>
   <div class="card">
-    <h2>${esc(playerName(lvlPlayer))||'Player'} — Progress</h2>
+    <h2>Squad Results</h2>
+    ${cols.length? `<div style="font-size:13px;color:var(--muted);margin-bottom:6px">First result → latest. Green means better than her own first test.</div>
+    <div style="overflow-x:auto"><table><tr><th>Player</th>${cols.map(t=>`<th>${esc(t)}</th>`).join('')}</tr>
+    ${ps.map(p=>`<tr><td style="white-space:nowrap">${esc(p.name)}</td>${cols.map(t=>`<td style="white-space:nowrap">${firstLatestCell(firstLatest(p.id,t),t)}</td>`).join('')}</tr>`).join('')}
+    </table></div>` : `<div class="empty">No results yet. The baseline is on ${fmtDate(TEST_DAYS[0].date)}.</div>`}
+  </div>
+  <div class="card">
+    <h2>Player Progress</h2>
+    <select id="lv-player">${ps.map(p=>`<option value="${p.id}" ${p.id===lvlPlayer?'selected':''}>${esc(p.num||'')} ${esc(p.name)}</option>`).join('')}</select>
     ${Object.keys(byTest).length? Object.entries(byTest).map(([t,arr])=>{
       const first=arr[0], last=arr[arr.length-1];
       const d=last.value-first.value;
       const improved= LOWER_BETTER(t)? d<0 : d>0;
       const cls= d===0? '' : (improved?'delta-up':'delta-dn');
-      const sign= d>0?'+':'';
+      const change= isBleep(t)
+        ? `${esc(fmtResult(first))} → <span class="${cls}">${esc(fmtResult(last))}</span> (${d===0?'same':improved?'better':'worse'})`
+        : `<span class="${cls}">${d>0?'+':''}${Math.round(d*100)/100}</span>`;
       return `<h3>${esc(t)}</h3>
       <table><tr><th>Date</th><th class="num">Result</th><th></th></tr>
-      ${arr.map(e=>`<tr><td>${fmtDate(e.date)}</td><td class="num">${e.value}</td><td style="width:34px;text-align:right"><button class="btn-sm btn-danger" style="padding:2px 8px" data-act="del-test" data-id="${e.id}">✕</button></td></tr>`).join('')}
+      ${arr.map(e=>`<tr><td>${fmtDate(e.date)}</td><td class="num">${esc(fmtResult(e))}</td><td style="width:34px;text-align:right"><button class="btn-sm btn-danger" style="padding:2px 8px" data-act="del-test" data-id="${e.id}">✕</button></td></tr>`).join('')}
       </table>
-      <div style="font-size:13px;margin:4px 0 8px">Change since first test: <span class="${cls}">${sign}${Math.round(d*100)/100}</span></div>`;
-    }).join('') : '<div class="empty">No results logged for this player yet. The season plan has testing windows in Nov, Feb, Apr and Aug.</div>'}
+      ${arr.length>1? `<div style="font-size:13px;margin:4px 0 8px">Change since first test: ${change}</div>`:''}`;
+    }).join('') : `<div class="empty">No results logged for this player yet.</div>`}
   </div>`;
 }
 
@@ -1395,9 +1451,10 @@ function bind(){
   const ap=document.getElementById('att-period');
   if(ap) ap.querySelectorAll('button').forEach(b=>b.onclick=()=>{attPeriod=b.dataset.p; render({keep:true});});
   const lp=document.getElementById('lv-player');
-  if(lp) lp.onchange=()=>{lvlPlayer=lp.value; render();};
+  if(lp) lp.onchange=()=>{lvlPlayer=lp.value; render({keep:true});};
   const lt=document.getElementById('lv-test');
-  if(lt) lt.onchange=()=>{document.getElementById('lv-custom').style.display= lt.value==='__c'?'block':'none';};
+  if(lt) lt.onchange=()=>{lvlTest=lt.value; render({keep:true});};
+  document.querySelectorAll('.lv-entry').forEach(el=>el.oninput=()=>{ testDraft[el.id]=el.value; });
   document.querySelectorAll('.mt-chk').forEach(c=>c.onchange=()=>{
     if(c.checked) pickLineup.add(c.value); else pickLineup.delete(c.value);
     document.getElementById('mt-count').textContent=pickLineup.size;
@@ -1493,14 +1550,42 @@ async function handle(d, el){
       DB.tests=DB.tests.filter(t=>t.id!==d.id); save(); render();
     }
   }
-  if(a==='add-test'){
-    const sel=document.getElementById('lv-test');
-    const test= sel.value==='__c'? document.getElementById('lv-custom').value.trim() : sel.value;
-    const val=parseFloat(document.getElementById('lv-val').value);
-    if(!test||isNaN(val)) return;
-    lvlPlayer=document.getElementById('lv-player').value;
-    DB.tests.push({id:uid(), playerId:lvlPlayer, test, value:val, date:document.getElementById('lv-date').value||today()});
+  if(a==='save-tests'){
+    const custom= lvlTest==='__c', def= custom? null : TESTS[+lvlTest];
+    const test= custom? document.getElementById('lv-custom').value.trim() : def.name;
+    if(!test){ notify('Name the test', 'Type a name for the custom test first.'); return; }
+    const date=document.getElementById('lv-date').value||today();
+    const key= custom? 'c' : lvlTest;
+    const results=[], bad=[];
+    activePlayers().forEach(p=>{
+      if(def && def.bleep){
+        const lv=document.getElementById(`lv-b-${p.id}-l`).value.trim(), sh=document.getElementById(`lv-b-${p.id}-s`).value.trim();
+        if(!lv && !sh) return;
+        const level=parseInt(lv,10), shuttle=parseInt(sh,10);
+        if(!(level>=1 && level<=21 && shuttle>=1 && shuttle<=16)){ bad.push(p.name); return; }
+        results.push({playerId:p.id, level, shuttle, value:level+shuttle/100});
+      } else {
+        const raw=document.getElementById(`lv-${key}-${p.id}`).value.trim();
+        if(!raw) return;
+        const value=parseFloat(raw);
+        if(!(value>0)){ bad.push(p.name); return; }
+        results.push({playerId:p.id, value});
+      }
+    });
+    if(bad.length){ notify('Check these results', `${bad.join(', ')}: ${def&&def.bleep? 'level must be 1–21 and shuttle 1–16' : 'enter a number above 0'}. Nothing was saved yet.`); return; }
+    if(!results.length){ notify('No results entered', 'Fill in a result for at least one player.'); return; }
+    /* a second entry for the same player, test and day replaces the first, so a corrected time doesn't count twice */
+    let replaced=0;
+    results.forEach(r=>{
+      const i=DB.tests.findIndex(e=>e.playerId===r.playerId && e.test===test && e.date===date);
+      if(i>=0){ DB.tests.splice(i,1); replaced++; }
+      DB.tests.push({id:uid(), test, date, ...r});
+    });
+    /* this test's typed results are saved; drop them from the draft */
+    const prefix= def&&def.bleep? 'lv-b-' : `lv-${key}-`;
+    Object.keys(testDraft).forEach(k=>{ if(k.startsWith(prefix)) delete testDraft[k]; });
     save(); render();
+    notify(`Saved ${results.length} result${results.length===1?'':'s'}`, `${test} on ${fmtDate(date)}.${replaced?` ${replaced} replaced an earlier entry from the same day.`:''}`);
   }
   if(a==='start-match'){
     const opp=document.getElementById('mt-opp').value.trim();
