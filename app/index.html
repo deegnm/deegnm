@@ -969,6 +969,16 @@ function viewLevels(){
   entries.forEach(e=>{(byTest[e.test]=byTest[e.test]||[]).push(e);});
   const cols=testColumns();
   return `
+  ${viewImport()}
+  <div class="card">
+    <h2>Import Results</h2>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:8px">Already have results in a spreadsheet? Upload the Excel or CSV file, or copy the rows (names and results, with the heading row) and paste them. You'll see a preview to check before anything is saved.</div>
+    <div class="row">
+      <button class="btn-ghost grow" data-act="import-file">⬆ Upload spreadsheet</button>
+      <button class="btn-ghost grow" data-act="import-paste">📋 Paste rows</button>
+    </div>
+    <input type="file" id="im-file" accept=".xlsx,.xls,.ods,.csv,.tsv,.txt" style="display:none">
+  </div>
   <div class="card">
     <h2>Test Day</h2>
     <div style="font-size:13px;color:var(--muted);margin-bottom:4px">${TEST_DAYS.map(d=>`${d.label}: <b>${fmtDate(d.date)}</b>`).join(' · ')}. Same tests, same order, same surface both times. Bleep test last.</div>
@@ -1006,6 +1016,230 @@ function viewLevels(){
       ${arr.length>1? `<div style="font-size:13px;margin:4px 0 8px">Change since first test: ${change}</div>`:''}`;
     }).join('') : `<div class="empty">No results logged for this player yet.</div>`}
   </div>`;
+}
+
+/* ================= IMPORT TEST RESULTS =================
+   Reads a results spreadsheet (Excel, CSV, or rows pasted from Google Sheets),
+   works out which column is which test and which row is which player, and
+   shows an editable preview to check before anything is saved. Handles a
+   plain "Player | test | test…" layout and the coach guide's results sheet,
+   where a test name spans "Wk 1 | Wk 14" columns on a second header row. */
+const XLSX_URL='https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+let IMP=null;
+function loadXLSX(){
+  if(window.XLSX) return Promise.resolve(window.XLSX);
+  return new Promise((res,rej)=>{
+    const sc=document.createElement('script');
+    sc.src=XLSX_URL; sc.onload=()=>res(window.XLSX); sc.onerror=()=>rej(new Error('offline'));
+    document.head.appendChild(sc);
+  });
+}
+/* CSV / TSV / semicolon text into rows of cells, honouring quoted cells */
+function parseDelimited(text){
+  const first=text.split(/\r?\n/).find(l=>l.trim())||'';
+  const delim= first.includes('\t')? '\t' : (first.split(';').length>first.split(',').length? ';' : ',');
+  const rows=[]; let row=[], cell='', q=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i];
+    if(q){ if(c==='"'){ if(text[i+1]==='"'){ cell+='"'; i++; } else q=false; } else cell+=c; continue; }
+    if(c==='"') q=true;
+    else if(c===delim){ row.push(cell); cell=''; }
+    else if(c==='\n' || c==='\r'){ if(c==='\r' && text[i+1]==='\n') i++; row.push(cell); rows.push(row); row=[]; cell=''; }
+    else cell+=c;
+  }
+  if(cell!=='' || row.length){ row.push(cell); rows.push(row); }
+  return rows;
+}
+async function readSheetFile(file){
+  if(/\.(csv|tsv|txt)$/i.test(file.name)) return parseDelimited(await file.text());
+  const X=await loadXLSX();
+  const wb=X.read(await file.arrayBuffer(), {type:'array'});
+  /* the first sheet that has anything in it */
+  for(const n of wb.SheetNames){
+    const rows=X.utils.sheet_to_json(wb.Sheets[n], {header:1, raw:false, defval:''});
+    if(rows.some(r=>r.some(c=>String(c).trim()))) return rows;
+  }
+  return [];
+}
+const normName=s=>String(s||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/[^a-z]+/g,' ').trim();
+function editDistance(a,b){
+  const d=Array.from({length:a.length+1},(_,i)=>[i]);
+  for(let j=1;j<=b.length;j++) d[0][j]=j;
+  for(let i=1;i<=a.length;i++) for(let j=1;j<=b.length;j++)
+    d[i][j]=Math.min(d[i-1][j]+1, d[i][j-1]+1, d[i-1][j-1]+(a[i-1]===b[j-1]?0:1));
+  return d[a.length][b.length];
+}
+/* a spreadsheet name to a squad player: exact, then "Surname, First", then a
+   near-miss spelling (at most 2 letters out) — only when exactly one player fits */
+function matchPlayer(raw){
+  const pool=DB.players.filter(p=>!p.removed);
+  let n=normName(String(raw).replace(/^\s*\d+[.)]?\s*/,''));
+  if(!n) return null;
+  if(String(raw).includes(',')){ const [a,b]=String(raw).split(','); n=normName(`${b} ${a}`); }
+  const exact=pool.filter(p=>normName(p.name)===n);
+  if(exact.length===1) return exact[0].id;
+  const close=pool.map(p=>({p, d:editDistance(normName(p.name), n)})).filter(x=>x.d<=2).sort((a,b)=>a.d-b.d);
+  if(close.length && (close.length===1 || close[0].d<close[1].d)) return close[0].p.id;
+  return null;
+}
+/* which of the guide's tests a header names (index into TESTS), or -1 */
+function testFromHeader(h){
+  const t=h.toLowerCase();
+  if(/sprint|20\s*m\b/.test(t)) return 0;
+  if(/broad|jump/.test(t)) return 1;
+  if(/5\s*[-–]?\s*0\s*[-–]?\s*5/.test(t)){
+    if(/\bl(eft)?\b|\(l\)/.test(t)) return 2;
+    if(/\br(ight)?\b|\(r\)/.test(t)) return 3;
+    return -1; /* foot not given: the coach chooses */
+  }
+  if(/bleep|beep|shuttle|multi\s*stage|mstf|yo-?yo/.test(t)) return 4;
+  return -1;
+}
+function weekFromHeader(h){
+  const t=h.toLowerCase();
+  if(/\bw(ee)?k\.?\s*14\b|retest|\bmar/.test(t)) return 'w14';
+  if(/\bw(ee)?k\.?\s*1\b|baseline|\bnov/.test(t)) return 'w1';
+  return 'd';
+}
+function analyseSheet(rows){
+  rows=rows.map(r=>r.map(c=>String(c??'').trim()));
+  const isNameHdr=c=>/^(player|name|full name|athlete|first|surname|last)/i.test(c);
+  /* header row: the first of the top ten with a name heading or two test headings */
+  let h=rows.slice(0,10).findIndex(r=>r.some(isNameHdr) || r.filter(c=>testFromHeader(c)>=0).length>=2);
+  if(h<0) h=0;
+  const top=rows[h]||[];
+  let labels=top.slice();
+  let start=h+1;
+  /* a second header row of week labels: carry each test name across its week columns */
+  const sub=rows[h+1]||[];
+  if(sub.some(c=>weekFromHeader(c)!=='d') && !sub.some(c=>matchPlayer(c))){
+    let carry='';
+    labels=sub.map((c,i)=>{ if(top[i]) carry=top[i]; return `${carry} ${c}`.trim(); });
+    for(let i=sub.length;i<top.length;i++) labels[i]=top[i];
+    start=h+2;
+  }
+  const width=Math.max(...rows.slice(start).map(r=>r.length), labels.length);
+  /* name columns: a single name heading, or first + surname side by side */
+  const lower=labels.map(l=>l.toLowerCase());
+  let nameCols=[];
+  const fi=lower.findIndex(l=>/^first/.test(l)), si=lower.findIndex(l=>/^(surname|last)/.test(l));
+  if(fi>=0 && si>=0) nameCols=[fi,si];
+  else { const ni=lower.findIndex(l=>/^(player|name|full name|athlete)/.test(l)); if(ni>=0) nameCols=[ni]; }
+  if(!nameCols.length){
+    /* no heading: the column whose cells match the most players */
+    let best=-1, bestN=0;
+    for(let c=0;c<width;c++){ const n=rows.slice(start).filter(r=>matchPlayer(r[c]||'')).length; if(n>bestN){ best=c; bestN=n; } }
+    nameCols=[best>=0? best : 0];
+  }
+  const columns=[];
+  for(let c=0;c<width;c++){
+    if(nameCols.includes(c)) continue;
+    const label=labels[c]||'';
+    const hasData=rows.slice(start).some(r=>(r[c]||'')!=='');
+    if(!label && !hasData) continue;
+    const ti=testFromHeader(label);
+    columns.push({idx:c, label: label||`Column ${c+1}`, map: ti>=0? `${ti}|${weekFromHeader(label)}` : 'ign'});
+  }
+  const people=[];
+  rows.slice(start).forEach(r=>{
+    const name=nameCols.map(c=>r[c]||'').join(' ').trim();
+    if(!name || /^\d+[.)]?$/.test(name)) return;
+    if(!columns.some(col=>(r[col.idx]||'')!=='')) return;
+    const playerId= nameCols.length===2? matchPlayer(`${r[nameCols[0]]} ${r[nameCols[1]]}`) : matchPlayer(name);
+    people.push({name, playerId: playerId||'', cells: Object.fromEntries(columns.map(col=>[col.idx, r[col.idx]||'']))});
+  });
+  return {columns, people};
+}
+/* a bleep score from a cell: "7.4", "7/4", "7-4", "L7 S4" */
+function parseBleep(s){
+  const m=String(s).match(/(\d+)\s*(?:[.\-\/:,]|\s*s(?:huttle)?\s*)\s*(\d+)/i) || String(s).match(/l(?:evel)?\s*(\d+).*?s(?:huttle)?\s*(\d+)/i);
+  if(!m) return null;
+  const level=+m[1], shuttle=+m[2];
+  return (level>=1 && level<=21 && shuttle>=1 && shuttle<=16)? {level, shuttle} : null;
+}
+/* Excel shows 7.10 as 7.1 unless the cell is text, so a ".1" bleep may really be shuttle 10 */
+const bleepAmbiguous=s=>/^\s*\d+\.1\s*$/.test(String(s));
+function parseNumber(s){
+  const v=parseFloat(String(s).replace(',', '.').replace(/[^\d.\-]/g,''));
+  return isNaN(v)? null : v;
+}
+function mappingOptions(col){
+  const opts=[['ign','Ignore this column']];
+  TESTS.forEach((t,i)=>{
+    opts.push([`${i}|d`, `${t.name}`]);
+    TEST_DAYS.forEach((d,k)=>opts.push([`${i}|${k?'w14':'w1'}`, `${t.name} · ${d.label}`]));
+  });
+  opts.push([`own`, `Its own test: "${col.label}"`]);
+  return opts.map(([v,l])=>`<option value="${esc(v)}" ${v===col.map?'selected':''}>${esc(l)}</option>`).join('');
+}
+function viewImport(){
+  if(!IMP) return '';
+  const cols=IMP.columns;
+  const anyBleepWarn=IMP.people.some(p=>cols.some(c=>c.map.startsWith('4|') && bleepAmbiguous(p.cells[c.idx])));
+  const playerOpts=sel=>`<option value="">— skip this row —</option>`+DB.players.filter(p=>!p.removed).sort(byNum)
+    .map(p=>`<option value="${p.id}" ${p.id===sel?'selected':''}>${esc(p.name)}</option>`).join('');
+  const unmatched=IMP.people.filter(p=>!p.playerId).length;
+  return `<div class="card" id="import-card">
+    <h2>Check Import</h2>
+    <div style="font-size:13px;color:var(--muted)">From <b>${esc(IMP.source)}</b>: ${IMP.people.length} player rows. Check each column's test and fix anything that looks wrong, then save.</div>
+    ${unmatched? `<div style="font-size:13px;color:var(--bad);font-weight:600;margin-top:6px">${unmatched} name${unmatched===1?'':'s'} didn't match a player. Pick who it is, or leave as skip.</div>`:''}
+    ${anyBleepWarn? `<div style="font-size:13px;color:#9A5B12;font-weight:600;margin-top:6px">⚠ Bleep scores ending in .1 may really be shuttle 10 (Excel drops the 0 in 7.10). Check the ones marked ⚠.</div>`:''}
+    ${cols.some(c=>c.map==='ign' && /5\s*[-–]?\s*0\s*[-–]?\s*5/.test(c.label))? `<div style="font-size:13px;color:#9A5B12;font-weight:600;margin-top:6px">⚠ A 5-0-5 column doesn't say which foot, so it's ignored for now. Choose Left Foot, Right Foot or "Its own test" in its column.</div>`:''}
+    <div style="font-size:12px;color:var(--muted);margin-top:6px">Blank cells and entries like "inj", "-" or "DNS" are skipped.</div>
+    <label class="f">Date for columns without a week</label><input id="im-date" type="date" value="${esc(IMP.date)}">
+    <div style="overflow-x:auto;margin-top:8px"><table>
+      <tr><th>Spreadsheet name → player</th>${cols.map(c=>`<th style="min-width:150px"><div style="text-transform:none;font-weight:400;margin-bottom:4px">${esc(c.label)}</div>
+        <select id="im-m${c.idx}" data-im-map="${c.idx}" style="font-size:13px;padding:6px">${mappingOptions(c)}</select></th>`).join('')}</tr>
+      ${IMP.people.map((p,ri)=>`<tr>
+        <td style="min-width:170px"><div style="font-size:12px;color:var(--muted)">${esc(p.name)}</div>
+          <select id="im-p${ri}" data-im-player="${ri}" style="font-size:13px;padding:6px;${p.playerId?'':'border-color:var(--bad)'}">${playerOpts(p.playerId)}</select></td>
+        ${cols.map(c=>{ const v=p.cells[c.idx]; const warn=c.map.startsWith('4|') && bleepAmbiguous(v);
+          return `<td>${c.map==='ign'? `<span style="color:var(--muted)">${esc(v)||'—'}</span>`
+            : `<input id="im-r${ri}-c${c.idx}" data-im-cell="${ri}|${c.idx}" value="${esc(v)}" style="width:90px;font-size:14px;padding:6px;${warn?'border-color:#C98B1F':''}">${warn?' ⚠':''}`}</td>`; }).join('')}
+      </tr>`).join('')}
+    </table></div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn-ghost grow" data-act="import-cancel">Cancel</button>
+      <button class="btn-p grow" data-act="import-save">Save results</button>
+    </div>
+  </div>`;
+}
+function startImport(rows, source){
+  const a=analyseSheet(rows);
+  if(!a.people.length){ notify('Nothing to import', 'No rows with a player name and results were found. Check the file has a name column and a results column.'); return; }
+  IMP={...a, source, date:today()};
+  TAB='levels'; render();
+  const card=document.getElementById('import-card'); if(card) card.scrollIntoView({behavior:'smooth'});
+}
+/* turn the checked preview into test entries; nothing is saved if any cell is unreadable */
+function importResults(){
+  const results=[], bad=[];
+  IMP.people.forEach(p=>{
+    if(!p.playerId) return;
+    IMP.columns.forEach(c=>{
+      if(c.map==='ign') return;
+      const raw=String(p.cells[c.idx]||'').trim();
+      if(!raw || /^[-–—]$|^n\/?a$|^dns$|^inj/i.test(raw)) return;
+      let test, date=IMP.date, def=null;
+      if(c.map==='own'){ test=c.label; }
+      else {
+        const [ti,wk]=c.map.split('|'); def=TESTS[+ti]; test=def.name;
+        if(wk==='w1') date=TEST_DAYS[0].date; else if(wk==='w14') date=TEST_DAYS[1].date;
+      }
+      if(def && def.bleep){
+        const b=parseBleep(raw);
+        if(!b){ bad.push(`${p.name} (${c.label}: "${raw}")`); return; }
+        results.push({playerId:p.playerId, test, date, level:b.level, shuttle:b.shuttle, value:b.level+b.shuttle/100});
+      } else {
+        let v=parseNumber(raw);
+        if(v===null || v<=0){ bad.push(`${p.name} (${c.label}: "${raw}")`); return; }
+        /* a broad jump under 5 was written in metres */
+        if(def && def.unit==='cm' && v<5) v=Math.round(v*100);
+        results.push({playerId:p.playerId, test, date, value:v});
+      }
+    });
+  });
+  return {results, bad};
 }
 
 /* ================= MATCH ================= */
@@ -1455,6 +1689,13 @@ function bind(){
   const lt=document.getElementById('lv-test');
   if(lt) lt.onchange=()=>{lvlTest=lt.value; render({keep:true});};
   document.querySelectorAll('.lv-entry').forEach(el=>el.oninput=()=>{ testDraft[el.id]=el.value; });
+  /* the import preview edits IMP directly; a column's test changing redraws the grid */
+  if(IMP){
+    const d=document.getElementById('im-date'); if(d) d.onchange=()=>{ IMP.date=d.value||today(); };
+    document.querySelectorAll('[data-im-player]').forEach(el=>el.onchange=()=>{ IMP.people[+el.dataset.imPlayer].playerId=el.value; render(); });
+    document.querySelectorAll('[data-im-cell]').forEach(el=>el.oninput=()=>{ const [r,c]=el.dataset.imCell.split('|'); IMP.people[+r].cells[c]=el.value; });
+    document.querySelectorAll('[data-im-map]').forEach(el=>el.onchange=()=>{ IMP.columns.find(c=>c.idx===+el.dataset.imMap).map=el.value; render(); });
+  }
   document.querySelectorAll('.mt-chk').forEach(c=>c.onchange=()=>{
     if(c.checked) pickLineup.add(c.value); else pickLineup.delete(c.value);
     document.getElementById('mt-count').textContent=pickLineup.size;
@@ -1549,6 +1790,48 @@ async function handle(d, el){
     if(await ask('Delete this test result?', '', 'Delete', true)){
       DB.tests=DB.tests.filter(t=>t.id!==d.id); save(); render();
     }
+  }
+  if(a==='import-file'){
+    const f=document.getElementById('im-file');
+    f.onchange=async ()=>{
+      const file=f.files[0]; f.value='';
+      if(!file) return;
+      try{ startImport(await readSheetFile(file), file.name); }
+      catch(e){ notify('Couldn\'t read that file', e&&e.message==='offline'
+        ? 'Reading Excel files needs signal the first time. Connect and try again, or save the sheet as CSV.'
+        : 'Save it as .xlsx or .csv and try again, or copy the rows and use Paste rows.'); }
+    };
+    f.click();
+  }
+  if(a==='import-paste'){
+    showSheet(`<h3>Paste rows</h3>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:8px">In your spreadsheet, select the heading row and every player's row, copy, then paste here.</div>
+      <textarea id="im-paste" rows="8" style="width:100%;font-size:13px;padding:8px;border:1.5px solid var(--line);border-radius:8px" placeholder="Player&#9;20m Sprint&#9;Broad Jump&#9;…"></textarea>
+      <button class="btn-p btn-block" style="margin-top:10px" id="im-paste-go">Preview</button>`,
+      root=>{ root.querySelector('#im-paste-go').onclick=()=>{
+        const text=root.querySelector('#im-paste').value;
+        if(!text.trim()) return;
+        closeSheet(); startImport(parseDelimited(text), 'pasted rows');
+      };});
+  }
+  if(a==='import-cancel'){ IMP=null; render(); }
+  if(a==='import-save'){
+    const {results, bad}=importResults();
+    if(bad.length){ notify('Check these results', `${bad.slice(0,6).join('; ')}${bad.length>6?` and ${bad.length-6} more`:''}. Fix them in the preview (or set the column to Ignore). Nothing was saved yet.`); return; }
+    if(!results.length){ notify('Nothing to save', 'No rows are matched to a player with a result in a test column.'); return; }
+    const dates=[...new Set(results.map(r=>r.date))].sort();
+    const tests=new Set(results.map(r=>r.test));
+    const players=new Set(results.map(r=>r.playerId));
+    const ok=await ask('Save imported results?', `${results.length} results for ${players.size} players across ${tests.size} test${tests.size===1?'':'s'}, dated ${dates.map(fmtDate).join(' and ')}. A result already saved for the same player, test and day is replaced.`, 'Save results');
+    if(!ok) return;
+    let replaced=0;
+    results.forEach(r=>{
+      const i=DB.tests.findIndex(e=>e.playerId===r.playerId && e.test===r.test && e.date===r.date);
+      if(i>=0){ DB.tests.splice(i,1); replaced++; }
+      DB.tests.push({id:uid(), ...r});
+    });
+    IMP=null; save(); render();
+    notify(`Imported ${results.length} results`, replaced? `${replaced} replaced earlier entries from the same day.` : '');
   }
   if(a==='save-tests'){
     const custom= lvlTest==='__c', def= custom? null : TESTS[+lvlTest];

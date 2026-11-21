@@ -11,7 +11,8 @@ self.addEventListener('install',e=>{
 self.addEventListener('activate',e=>{
   e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim()));
 });
-const cacheable=req=> req.url.startsWith(self.location.origin) || req.url.includes('fonts.');
+/* fonts, and the Excel reader the results import loads from cdnjs */
+const cacheable=req=> req.url.startsWith(self.location.origin) || req.url.includes('fonts.') || req.url.startsWith('https://cdnjs.cloudflare.com/');
 function fromNetwork(req){
   return fetch(req).then(res=>{
     if(res.ok && cacheable(req)){
