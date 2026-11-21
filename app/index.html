@@ -1051,15 +1051,15 @@ function parseDelimited(text){
   return rows;
 }
 async function readSheetFile(file){
-  if(/\.(csv|tsv|txt)$/i.test(file.name)) return parseDelimited(await file.text());
+  if(/\.(csv|tsv|txt)$/i.test(file.name)) return {rows: parseDelimited(await file.text())};
   const X=await loadXLSX();
   const wb=X.read(await file.arrayBuffer(), {type:'array'});
   /* the first sheet that has anything in it */
   for(const n of wb.SheetNames){
     const rows=X.utils.sheet_to_json(wb.Sheets[n], {header:1, raw:false, defval:''});
-    if(rows.some(r=>r.some(c=>String(c).trim()))) return rows;
+    if(rows.some(r=>r.some(c=>String(c).trim()))) return {rows, sheet: wb.SheetNames.length>1? n : ''};
   }
-  return [];
+  return {rows: []};
 }
 const normName=s=>String(s||'').normalize('NFD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/[^a-z]+/g,' ').trim();
 function editDistance(a,b){
@@ -1092,8 +1092,27 @@ function testFromHeader(h){
     if(/\br(ight)?\b|\(r\)/.test(t)) return 3;
     return -1; /* foot not given: the coach chooses */
   }
-  if(/bleep|beep|shuttle|multi\s*stage|mstf|yo-?yo/.test(t)) return 4;
+  if(/yo-?yo/.test(t)) return -1; /* a different test from the bleep test: kept as its own */
+  if(/bleep|beep|shuttle|multi\s*stage|mstf/.test(t)) return 4;
   return -1;
+}
+const isInches=h=>/\(in\)|\binch/i.test(h);
+const MONTHS=['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+/* a test date named in the sheet ("Tested 19 Nov", "Round 1", "Week 14"), or null */
+function dateFromText(texts){
+  const all=texts.join(' ').toLowerCase();
+  const m=all.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/);
+  if(m){
+    const mm=String(MONTHS.indexOf(m[2])+1).padStart(2,'0'), dd=String(+m[1]).padStart(2,'0');
+    const known=TEST_DAYS.find(d=>d.date.slice(5)===`${mm}-${dd}`);
+    if(known) return known.date;
+    /* the most recent such date that isn't in the future */
+    const y=new Date().getFullYear(), cand=`${y}-${mm}-${dd}`;
+    return cand<=today()? cand : `${y-1}-${mm}-${dd}`;
+  }
+  if(/round\s*1\b|baseline|w(ee)?k\.?\s*1\b/.test(all)) return TEST_DAYS[0].date;
+  if(/round\s*2\b|retest|w(ee)?k\.?\s*14\b/.test(all)) return TEST_DAYS[1].date;
+  return null;
 }
 function weekFromHeader(h){
   const t=h.toLowerCase();
@@ -1101,7 +1120,7 @@ function weekFromHeader(h){
   if(/\bw(ee)?k\.?\s*1\b|baseline|\bnov/.test(t)) return 'w1';
   return 'd';
 }
-function analyseSheet(rows){
+function analyseSheet(rows, context=[]){
   rows=rows.map(r=>r.map(c=>String(c??'').trim()));
   const isNameHdr=c=>/^(player|name|full name|athlete|first|surname|last)/i.test(c);
   /* header row: the first of the top ten with a name heading or two test headings */
@@ -1131,24 +1150,32 @@ function analyseSheet(rows){
     for(let c=0;c<width;c++){ const n=rows.slice(start).filter(r=>matchPlayer(r[c]||'')).length; if(n>bestN){ best=c; bestN=n; } }
     nameCols=[best>=0? best : 0];
   }
+  const noteCol=lower.findIndex(l=>/^(notes?|comments?)\b/.test(l));
+  const jumpCm=labels.some(l=>testFromHeader(l)===1 && !isInches(l));
   const columns=[];
   for(let c=0;c<width;c++){
-    if(nameCols.includes(c)) continue;
+    if(nameCols.includes(c) || c===noteCol) continue;
     const label=labels[c]||'';
     const hasData=rows.slice(start).some(r=>(r[c]||'')!=='');
     if(!label && !hasData) continue;
     const ti=testFromHeader(label);
-    columns.push({idx:c, label: label||`Column ${c+1}`, map: ti>=0? `${ti}|${weekFromHeader(label)}` : 'ign'});
+    let map= ti>=0? `${ti}|${weekFromHeader(label)}` : (/yo-?yo/i.test(label)? 'own' : 'ign');
+    /* a jump in inches is only used when the sheet has no cm column, and is converted */
+    const inches= ti===1 && isInches(label);
+    if(inches && jumpCm) map='ign';
+    columns.push({idx:c, label: label||`Column ${c+1}`, map, inches});
   }
   const people=[];
   rows.slice(start).forEach(r=>{
     const name=nameCols.map(c=>r[c]||'').join(' ').trim();
     if(!name || /^\d+[.)]?$/.test(name)) return;
-    if(!columns.some(col=>(r[col.idx]||'')!=='')) return;
+    /* players with nothing in any results column weren't tested: leave them out */
+    if(!columns.some(col=>col.map!=='ign' && (r[col.idx]||'')!=='')) return;
     const playerId= nameCols.length===2? matchPlayer(`${r[nameCols[0]]} ${r[nameCols[1]]}`) : matchPlayer(name);
-    people.push({name, playerId: playerId||'', cells: Object.fromEntries(columns.map(col=>[col.idx, r[col.idx]||'']))});
+    people.push({name, playerId: playerId||'', note: noteCol>=0? (r[noteCol]||'') : '',
+      cells: Object.fromEntries(columns.map(col=>[col.idx, r[col.idx]||'']))});
   });
-  return {columns, people};
+  return {columns, people, date: dateFromText([...labels, ...context])};
 }
 /* a bleep score from a cell: "7.4", "7/4", "7-4", "L7 S4" */
 function parseBleep(s){
@@ -1184,14 +1211,16 @@ function viewImport(){
     <div style="font-size:13px;color:var(--muted)">From <b>${esc(IMP.source)}</b>: ${IMP.people.length} player rows. Check each column's test and fix anything that looks wrong, then save.</div>
     ${unmatched? `<div style="font-size:13px;color:var(--bad);font-weight:600;margin-top:6px">${unmatched} name${unmatched===1?'':'s'} didn't match a player. Pick who it is, or leave as skip.</div>`:''}
     ${anyBleepWarn? `<div style="font-size:13px;color:#9A5B12;font-weight:600;margin-top:6px">⚠ Bleep scores ending in .1 may really be shuttle 10 (Excel drops the 0 in 7.10). Check the ones marked ⚠.</div>`:''}
-    ${cols.some(c=>c.map==='ign' && /5\s*[-–]?\s*0\s*[-–]?\s*5/.test(c.label))? `<div style="font-size:13px;color:#9A5B12;font-weight:600;margin-top:6px">⚠ A 5-0-5 column doesn't say which foot, so it's ignored for now. Choose Left Foot, Right Foot or "Its own test" in its column.</div>`:''}
-    <div style="font-size:12px;color:var(--muted);margin-top:6px">Blank cells and entries like "inj", "-" or "DNS" are skipped.</div>
+    ${cols.some(c=>c.map==='ign' && /5\s*[-–]?\s*0\s*[-–]?\s*5/.test(c.label)) && !cols.some(c=>/^[23]\|/.test(c.map))? `<div style="font-size:13px;color:#9A5B12;font-weight:600;margin-top:6px">⚠ A 5-0-5 column doesn't say which foot, so it's ignored for now. Choose Left Foot, Right Foot or "Its own test" in its column.</div>`:''}
+    ${dupMappings().length? `<div style="font-size:13px;color:var(--bad);font-weight:600;margin-top:6px">Two columns are set to the same test and date (${esc(dupMappings().join(', '))}). Set one of them to Ignore.</div>`:''}
+    <div style="font-size:12px;color:var(--muted);margin-top:6px">Blank cells and entries like "inj", "-" or "DNS" are skipped.${IMP.columns.some(c=>c.inches && c.map!=='ign')? ' Jumps in inches are converted to cm.':''}</div>
     <label class="f">Date for columns without a week</label><input id="im-date" type="date" value="${esc(IMP.date)}">
     <div style="overflow-x:auto;margin-top:8px"><table>
       <tr><th>Spreadsheet name → player</th>${cols.map(c=>`<th style="min-width:150px"><div style="text-transform:none;font-weight:400;margin-bottom:4px">${esc(c.label)}</div>
         <select id="im-m${c.idx}" data-im-map="${c.idx}" style="font-size:13px;padding:6px">${mappingOptions(c)}</select></th>`).join('')}</tr>
       ${IMP.people.map((p,ri)=>`<tr>
         <td style="min-width:170px"><div style="font-size:12px;color:var(--muted)">${esc(p.name)}</div>
+          ${p.note? `<div style="font-size:12px;color:#9A5B12;margin:2px 0 4px">📝 ${esc(p.note)}</div>`:''}
           <select id="im-p${ri}" data-im-player="${ri}" style="font-size:13px;padding:6px;${p.playerId?'':'border-color:var(--bad)'}">${playerOpts(p.playerId)}</select></td>
         ${cols.map(c=>{ const v=p.cells[c.idx]; const warn=c.map.startsWith('4|') && bleepAmbiguous(v);
           return `<td>${c.map==='ign'? `<span style="color:var(--muted)">${esc(v)||'—'}</span>`
@@ -1204,12 +1233,20 @@ function viewImport(){
     </div>
   </div>`;
 }
-function startImport(rows, source){
-  const a=analyseSheet(rows);
+function startImport(rows, source, sheetName){
+  const a=analyseSheet(rows, [source, sheetName||'']);
   if(!a.people.length){ notify('Nothing to import', 'No rows with a player name and results were found. Check the file has a name column and a results column.'); return; }
-  IMP={...a, source, date:today()};
+  IMP={...a, source: sheetName? `${source} (sheet "${sheetName}")` : source, date: a.date||today()};
   TAB='levels'; render();
   const card=document.getElementById('import-card'); if(card) card.scrollIntoView({behavior:'smooth'});
+}
+function dupMappings(){
+  const seen={}, dup=new Set();
+  IMP.columns.filter(c=>c.map!=='ign' && c.map!=='own').forEach(c=>{
+    const [ti,wk]=c.map.split('|'); const k=`${TESTS[+ti].name}${wk==='w1'?' · Week 1':wk==='w14'?' · Week 14':''}`;
+    if(seen[k]) dup.add(k); seen[k]=1;
+  });
+  return [...dup];
 }
 /* turn the checked preview into test entries; nothing is saved if any cell is unreadable */
 function importResults(){
@@ -1233,8 +1270,9 @@ function importResults(){
       } else {
         let v=parseNumber(raw);
         if(v===null || v<=0){ bad.push(`${p.name} (${c.label}: "${raw}")`); return; }
+        if(c.inches && def && def.unit==='cm') v=Math.round(v*2.54);
         /* a broad jump under 5 was written in metres */
-        if(def && def.unit==='cm' && v<5) v=Math.round(v*100);
+        else if(def && def.unit==='cm' && v<5) v=Math.round(v*100);
         results.push({playerId:p.playerId, test, date, value:v});
       }
     });
@@ -1796,7 +1834,7 @@ async function handle(d, el){
     f.onchange=async ()=>{
       const file=f.files[0]; f.value='';
       if(!file) return;
-      try{ startImport(await readSheetFile(file), file.name); }
+      try{ const {rows, sheet}=await readSheetFile(file); startImport(rows, file.name, sheet); }
       catch(e){ notify('Couldn\'t read that file', e&&e.message==='offline'
         ? 'Reading Excel files needs signal the first time. Connect and try again, or save the sheet as CSV.'
         : 'Save it as .xlsx or .csv and try again, or copy the rows and use Paste rows.'); }
@@ -1816,6 +1854,7 @@ async function handle(d, el){
   }
   if(a==='import-cancel'){ IMP=null; render(); }
   if(a==='import-save'){
+    if(dupMappings().length){ notify('Two columns feed the same test', `${dupMappings().join(', ')}: set one of those columns to Ignore, then save.`); return; }
     const {results, bad}=importResults();
     if(bad.length){ notify('Check these results', `${bad.slice(0,6).join('; ')}${bad.length>6?` and ${bad.length-6} more`:''}. Fix them in the preview (or set the column to Ignore). Nothing was saved yet.`); return; }
     if(!results.length){ notify('Nothing to save', 'No rows are matched to a player with a result in a test column.'); return; }
