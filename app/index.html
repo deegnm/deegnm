@@ -230,6 +230,33 @@ const SEED=[
 'Holly Donaghy',
 'Cadhla Stilgies'
 ].map(n=>({id:uid(), name:n, num:null, pos:'', active:true}));
+/* Players added to the panel after the app went out. Each has a fixed id, so
+   every phone (and the shared page) adds the same record once and two
+   devices can't create duplicates; a player later removed keeps her record
+   and is never re-added. */
+const ADDED_PLAYERS=[
+  {id:'p-best-akinsehinde',  name:'Best Akinsehinde',  joined:'2026-11-21'},
+  {id:'p-benny-akinsehinde', name:'Benny Akinsehinde', joined:'2026-11-21'},
+];
+/* bring saved data up to date with the current app; true if anything changed */
+function upgradeData(){
+  let changed=false;
+  ADDED_PLAYERS.forEach(a=>{
+    if(DB.players.some(p=>p.id===a.id || normName(p.name)===normName(a.name))) return;
+    DB.players.push({id:a.id, name:a.name, num:null, pos:'', active:true, joined:a.joined});
+    changed=true;
+  });
+  /* Yo-Yo results imported before it became a standard test: move them under
+     its name and store the level and shuttle ("14.6" is level 14, shuttle 6) */
+  DB.tests.forEach(t=>{
+    if(t.test===YOYO || !/yo-?yo/i.test(t.test)) return;
+    const b=parseLevels(String(t.value), TESTS.find(x=>x.name===YOYO));
+    t.test=YOYO;
+    if(b){ t.level=b.level; t.shuttle=b.shuttle; t.value=b.level+b.shuttle/100; }
+    changed=true;
+  });
+  return changed;
+}
 /* local date, not UTC — toISOString() gives yesterday's date after midnight during Irish summer time */
 const today=()=>{const d=new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;};
 const DEFAULT_HALF=30;
@@ -252,6 +279,7 @@ async function load(){
   let found=false;
   if(v){ try{ DB=Object.assign(DB, JSON.parse(v)); found=true; }catch(e){} }
   if(!found || !DB.players.length){ DB.players=SEED; save(); }
+  if(upgradeData()) save();
   if(DB.settings && DB.settings.sideline) document.body.classList.add('sideline');
   /* live-match events need ids to sync one by one (older saves didn't have them) */
   if(DB.live) DB.live.events.forEach(e=>{ if(!e.id) e.id=uid(); });
@@ -366,6 +394,8 @@ function onRemote(){
     Object.entries(SYNC.remote).forEach(([k,v])=>SYNC.synced[k]=JSON.stringify(v));
     DB=dbFromDocs(clean(SYNC.remote));
     SYNC.state=SYNC.readonly?'readonly':'live';
+    /* the shared copy gets the same upgrades as this device's (new players, Yo-Yo results) */
+    if(upgradeData()) pushShared();
     storSet(JSON.stringify(DB)); redraw(); return;
   }
   if(SYNC.state==='empty' && Object.keys(SYNC.remote).length){
@@ -480,21 +510,24 @@ function onPitch(L){
 }
 /* Fitness tests from the U16 Girls Winter Programme coach guide (p.13), run on
    the same two Thursdays so results compare fairly. 5-0-5 is recorded per foot.
-   The bleep test is kept as level + shuttle: typed as one decimal, level 7
-   shuttle 10 ("7.10") would rank below 7.9, so `value` is level + shuttle/100
-   purely for ordering and the pair is what gets shown. Results logged under
+   The club runs the Yo-Yo intermittent recovery test in place of the guide's
+   bleep test. It is kept as level + shuttle (`value` is level + shuttle/100,
+   for ordering only; the pair is what gets shown). Results logged under
    older test names stay and still show in progress and reports. */
 const TESTS=[
   {name:'20m Sprint (s)',      unit:'s',  lower:true,  hint:'Best of 2 attempts, to 0.01 sec'},
   {name:'Broad Jump (cm)',     unit:'cm', lower:false, hint:'Best of 3 attempts. A fall or step back is re-done'},
   {name:'5-0-5 Left Foot (s)', unit:'s',  lower:true,  hint:'Best of 2, turning off the left foot'},
   {name:'5-0-5 Right Foot (s)',unit:'s',  lower:true,  hint:'Best of 2, turning off the right foot'},
-  {name:'Bleep Test',          bleep:true,lower:false, hint:'Level and shuttle reached (e.g. 7.4). Do it last'},
+  {name:'Yo-Yo Test',          levels:true, minLevel:5, maxLevel:23, maxShuttle:8, lower:false,
+   hint:'Level and shuttle reached (e.g. 14.6 is level 14, shuttle 6). Do it last'},
 ];
+const YOYO='Yo-Yo Test';
 const TEST_DAYS=[{label:'Week 1 baseline', date:'2026-11-19'}, {label:'Week 14 retest', date:'2027-03-04'}];
-const isBleep=t=>/bleep/i.test(t);
+/* tests scored as level.shuttle (the Yo-Yo test, or a bleep test logged before it replaced it) */
+const isLevelTest=t=>/yo-?yo|bleep/i.test(t);
 const LOWER_BETTER=t=>{ const d=TESTS.find(x=>x.name===t); return d? d.lower : /sprint|5-0-5|5-10-5/i.test(t); };
-/* how a result reads on screen: bleep as level.shuttle, everything else as entered */
+/* how a result reads on screen: level tests as level.shuttle, everything else as entered */
 function fmtResult(e){
   if(e.level!=null) return `${e.level}.${e.shuttle}`;
   return String(e.value);
@@ -751,6 +784,7 @@ function confirmRestore(q, d){
 function replaceAll(d){
   DB=Object.assign({players:[],sessions:[],tests:[],matches:[],live:null}, d);
   if(DB.live) DB.live.events.forEach(e=>{ if(!e.id) e.id=uid(); });
+  upgradeData();
   save();
 }
 function doImport(file){
@@ -953,15 +987,15 @@ function viewLevels(){
   if(!lvlPlayer && ps.length) lvlPlayer=ps[0].id;
   const custom= lvlTest==='__c';
   const def= custom? null : TESTS[+lvlTest];
-  const bleep= !!(def && def.bleep);
+  const levelTest= !!(def && def.levels);
   const key= custom? 'c' : lvlTest;
   const unit= def? (def.unit||'') : '';
   const entryRow=p=>`
     <div class="player-li" style="gap:8px">
       <span class="tag-num">${esc(p.num)||'–'}</span><span class="nm grow" style="min-width:0">${esc(p.name)}</span>
-      ${bleep
-        ? `<input id="lv-b-${p.id}-l" class="lv-entry" value="${draftVal(`lv-b-${p.id}-l`)}" type="number" min="1" max="21" inputmode="numeric" placeholder="Lvl" style="width:64px" aria-label="${esc(p.name)} level">
-           <input id="lv-b-${p.id}-s" class="lv-entry" value="${draftVal(`lv-b-${p.id}-s`)}" type="number" min="1" max="16" inputmode="numeric" placeholder="Sh" style="width:64px" aria-label="${esc(p.name)} shuttle">`
+      ${levelTest
+        ? `<input id="lv-b-${p.id}-l" class="lv-entry" value="${draftVal(`lv-b-${p.id}-l`)}" type="number" min="${def.minLevel}" max="${def.maxLevel}" inputmode="numeric" placeholder="Lvl" style="width:64px" aria-label="${esc(p.name)} level">
+           <input id="lv-b-${p.id}-s" class="lv-entry" value="${draftVal(`lv-b-${p.id}-s`)}" type="number" min="0" max="${def.maxShuttle}" inputmode="numeric" placeholder="Sh" style="width:64px" aria-label="${esc(p.name)} shuttle">`
         : `<input id="lv-${key}-${p.id}" class="lv-entry" value="${draftVal(`lv-${key}-${p.id}`)}" type="number" step="0.01" inputmode="decimal" placeholder="${esc(unit)}" style="width:96px" aria-label="${esc(p.name)} result">`}
     </div>`;
   const entries=DB.tests.filter(t=>t.playerId===lvlPlayer).sort((a,b)=>a.date.localeCompare(b.date));
@@ -981,7 +1015,7 @@ function viewLevels(){
   </div>
   <div class="card">
     <h2>Test Day</h2>
-    <div style="font-size:13px;color:var(--muted);margin-bottom:4px">${TEST_DAYS.map(d=>`${d.label}: <b>${fmtDate(d.date)}</b>`).join(' · ')}. Same tests, same order, same surface both times. Bleep test last.</div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:4px">${TEST_DAYS.map(d=>`${d.label}: <b>${fmtDate(d.date)}</b>`).join(' · ')}. Same tests, same order, same surface both times. Yo-Yo test last.</div>
     <label class="f">Test</label>
     <select id="lv-test">${TESTS.map((t,i)=>`<option value="${i}" ${String(i)===lvlTest?'selected':''}>${esc(t.name)}</option>`).join('')}<option value="__c" ${custom?'selected':''}>Custom…</option></select>
     <input id="lv-custom" placeholder="Custom test name" style="display:${custom?'block':'none'};margin-top:6px">
@@ -1006,7 +1040,7 @@ function viewLevels(){
       const d=last.value-first.value;
       const improved= LOWER_BETTER(t)? d<0 : d>0;
       const cls= d===0? '' : (improved?'delta-up':'delta-dn');
-      const change= isBleep(t)
+      const change= isLevelTest(t)
         ? `${esc(fmtResult(first))} → <span class="${cls}">${esc(fmtResult(last))}</span> (${d===0?'same':improved?'better':'worse'})`
         : `<span class="${cls}">${d>0?'+':''}${Math.round(d*100)/100}</span>`;
       return `<h3>${esc(t)}</h3>
@@ -1092,8 +1126,7 @@ function testFromHeader(h){
     if(/\br(ight)?\b|\(r\)/.test(t)) return 3;
     return -1; /* foot not given: the coach chooses */
   }
-  if(/yo-?yo/.test(t)) return -1; /* a different test from the bleep test: kept as its own */
-  if(/bleep|beep|shuttle|multi\s*stage|mstf/.test(t)) return 4;
+  if(/yo-?yo/.test(t)) return 4;
   return -1;
 }
 const isInches=h=>/\(in\)|\binch/i.test(h);
@@ -1159,7 +1192,8 @@ function analyseSheet(rows, context=[]){
     const hasData=rows.slice(start).some(r=>(r[c]||'')!=='');
     if(!label && !hasData) continue;
     const ti=testFromHeader(label);
-    let map= ti>=0? `${ti}|${weekFromHeader(label)}` : (/yo-?yo/i.test(label)? 'own' : 'ign');
+    /* a bleep test isn't one of the club's tests any more: keep it separate rather than mix it with Yo-Yo */
+    let map= ti>=0? `${ti}|${weekFromHeader(label)}` : (/bleep|beep|multi\s*stage|mstf/i.test(label)? 'own' : 'ign');
     /* a jump in inches is only used when the sheet has no cm column, and is converted */
     const inches= ti===1 && isInches(label);
     if(inches && jumpCm) map='ign';
@@ -1177,15 +1211,16 @@ function analyseSheet(rows, context=[]){
   });
   return {columns, people, date: dateFromText([...labels, ...context])};
 }
-/* a bleep score from a cell: "7.4", "7/4", "7-4", "L7 S4" */
-function parseBleep(s){
+/* a level.shuttle score from a cell: "14.6", "14/6", "14-6", "L14 S6", within the test's limits.
+   A whole level ("14" or "14.0", as the club's sheet records some) is kept as shuttle 0. */
+function parseLevels(s, def){
+  const whole=String(s).match(/^\s*(\d+)(?:\.0+)?\s*$/);
+  if(whole){ const level=+whole[1]; return (level>=def.minLevel && level<=def.maxLevel)? {level, shuttle:0} : null; }
   const m=String(s).match(/(\d+)\s*(?:[.\-\/:,]|\s*s(?:huttle)?\s*)\s*(\d+)/i) || String(s).match(/l(?:evel)?\s*(\d+).*?s(?:huttle)?\s*(\d+)/i);
   if(!m) return null;
   const level=+m[1], shuttle=+m[2];
-  return (level>=1 && level<=21 && shuttle>=1 && shuttle<=16)? {level, shuttle} : null;
+  return (level>=def.minLevel && level<=def.maxLevel && shuttle>=0 && shuttle<=def.maxShuttle)? {level, shuttle} : null;
 }
-/* Excel shows 7.10 as 7.1 unless the cell is text, so a ".1" bleep may really be shuttle 10 */
-const bleepAmbiguous=s=>/^\s*\d+\.1\s*$/.test(String(s));
 function parseNumber(s){
   const v=parseFloat(String(s).replace(',', '.').replace(/[^\d.\-]/g,''));
   return isNaN(v)? null : v;
@@ -1202,7 +1237,6 @@ function mappingOptions(col){
 function viewImport(){
   if(!IMP) return '';
   const cols=IMP.columns;
-  const anyBleepWarn=IMP.people.some(p=>cols.some(c=>c.map.startsWith('4|') && bleepAmbiguous(p.cells[c.idx])));
   const playerOpts=sel=>`<option value="">— skip this row —</option>`+DB.players.filter(p=>!p.removed).sort(byNum)
     .map(p=>`<option value="${p.id}" ${p.id===sel?'selected':''}>${esc(p.name)}</option>`).join('');
   const unmatched=IMP.people.filter(p=>!p.playerId).length;
@@ -1210,7 +1244,6 @@ function viewImport(){
     <h2>Check Import</h2>
     <div style="font-size:13px;color:var(--muted)">From <b>${esc(IMP.source)}</b>: ${IMP.people.length} player rows. Check each column's test and fix anything that looks wrong, then save.</div>
     ${unmatched? `<div style="font-size:13px;color:var(--bad);font-weight:600;margin-top:6px">${unmatched} name${unmatched===1?'':'s'} didn't match a player. Pick who it is, or leave as skip.</div>`:''}
-    ${anyBleepWarn? `<div style="font-size:13px;color:#9A5B12;font-weight:600;margin-top:6px">⚠ Bleep scores ending in .1 may really be shuttle 10 (Excel drops the 0 in 7.10). Check the ones marked ⚠.</div>`:''}
     ${cols.some(c=>c.map==='ign' && /5\s*[-–]?\s*0\s*[-–]?\s*5/.test(c.label)) && !cols.some(c=>/^[23]\|/.test(c.map))? `<div style="font-size:13px;color:#9A5B12;font-weight:600;margin-top:6px">⚠ A 5-0-5 column doesn't say which foot, so it's ignored for now. Choose Left Foot, Right Foot or "Its own test" in its column.</div>`:''}
     ${dupMappings().length? `<div style="font-size:13px;color:var(--bad);font-weight:600;margin-top:6px">Two columns are set to the same test and date (${esc(dupMappings().join(', '))}). Set one of them to Ignore.</div>`:''}
     <div style="font-size:12px;color:var(--muted);margin-top:6px">Blank cells and entries like "inj", "-" or "DNS" are skipped.${IMP.columns.some(c=>c.inches && c.map!=='ign')? ' Jumps in inches are converted to cm.':''}</div>
@@ -1222,9 +1255,9 @@ function viewImport(){
         <td style="min-width:170px"><div style="font-size:12px;color:var(--muted)">${esc(p.name)}</div>
           ${p.note? `<div style="font-size:12px;color:#9A5B12;margin:2px 0 4px">📝 ${esc(p.note)}</div>`:''}
           <select id="im-p${ri}" data-im-player="${ri}" style="font-size:13px;padding:6px;${p.playerId?'':'border-color:var(--bad)'}">${playerOpts(p.playerId)}</select></td>
-        ${cols.map(c=>{ const v=p.cells[c.idx]; const warn=c.map.startsWith('4|') && bleepAmbiguous(v);
+        ${cols.map(c=>{ const v=p.cells[c.idx];
           return `<td>${c.map==='ign'? `<span style="color:var(--muted)">${esc(v)||'—'}</span>`
-            : `<input id="im-r${ri}-c${c.idx}" data-im-cell="${ri}|${c.idx}" value="${esc(v)}" style="width:90px;font-size:14px;padding:6px;${warn?'border-color:#C98B1F':''}">${warn?' ⚠':''}`}</td>`; }).join('')}
+            : `<input id="im-r${ri}-c${c.idx}" data-im-cell="${ri}|${c.idx}" value="${esc(v)}" style="width:90px;font-size:14px;padding:6px">`}</td>`; }).join('')}
       </tr>`).join('')}
     </table></div>
     <div class="row" style="margin-top:10px">
@@ -1263,8 +1296,8 @@ function importResults(){
         const [ti,wk]=c.map.split('|'); def=TESTS[+ti]; test=def.name;
         if(wk==='w1') date=TEST_DAYS[0].date; else if(wk==='w14') date=TEST_DAYS[1].date;
       }
-      if(def && def.bleep){
-        const b=parseBleep(raw);
+      if(def && def.levels){
+        const b=parseLevels(raw, def);
         if(!b){ bad.push(`${p.name} (${c.label}: "${raw}")`); return; }
         results.push({playerId:p.playerId, test, date, level:b.level, shuttle:b.shuttle, value:b.level+b.shuttle/100});
       } else {
@@ -1880,11 +1913,11 @@ async function handle(d, el){
     const key= custom? 'c' : lvlTest;
     const results=[], bad=[];
     activePlayers().forEach(p=>{
-      if(def && def.bleep){
+      if(def && def.levels){
         const lv=document.getElementById(`lv-b-${p.id}-l`).value.trim(), sh=document.getElementById(`lv-b-${p.id}-s`).value.trim();
         if(!lv && !sh) return;
         const level=parseInt(lv,10), shuttle=parseInt(sh,10);
-        if(!(level>=1 && level<=21 && shuttle>=1 && shuttle<=16)){ bad.push(p.name); return; }
+        if(!(level>=def.minLevel && level<=def.maxLevel && shuttle>=0 && shuttle<=def.maxShuttle)){ bad.push(p.name); return; }
         results.push({playerId:p.id, level, shuttle, value:level+shuttle/100});
       } else {
         const raw=document.getElementById(`lv-${key}-${p.id}`).value.trim();
@@ -1894,7 +1927,7 @@ async function handle(d, el){
         results.push({playerId:p.id, value});
       }
     });
-    if(bad.length){ notify('Check these results', `${bad.join(', ')}: ${def&&def.bleep? 'level must be 1–21 and shuttle 1–16' : 'enter a number above 0'}. Nothing was saved yet.`); return; }
+    if(bad.length){ notify('Check these results', `${bad.join(', ')}: ${def&&def.levels? `level must be ${def.minLevel}–${def.maxLevel} and shuttle 0–${def.maxShuttle}` : 'enter a number above 0'}. Nothing was saved yet.`); return; }
     if(!results.length){ notify('No results entered', 'Fill in a result for at least one player.'); return; }
     /* a second entry for the same player, test and day replaces the first, so a corrected time doesn't count twice */
     let replaced=0;
@@ -1904,7 +1937,7 @@ async function handle(d, el){
       DB.tests.push({id:uid(), test, date, ...r});
     });
     /* this test's typed results are saved; drop them from the draft */
-    const prefix= def&&def.bleep? 'lv-b-' : `lv-${key}-`;
+    const prefix= def&&def.levels? 'lv-b-' : `lv-${key}-`;
     Object.keys(testDraft).forEach(k=>{ if(k.startsWith(prefix)) delete testDraft[k]; });
     save(); render();
     notify(`Saved ${results.length} result${results.length===1?'':'s'}`, `${test} on ${fmtDate(date)}.${replaced?` ${replaced} replaced an earlier entry from the same day.`:''}`);
